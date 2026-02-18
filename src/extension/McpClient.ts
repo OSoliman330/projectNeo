@@ -64,10 +64,10 @@ export class McpClient {
             }
         }
 
-        const servers: Record<string, McpServerConfig> = config.mcp?.servers || {};
+        const servers: Record<string, McpServerConfig> = config.mcpServers || config.mcp?.servers || {};
 
         if (Object.keys(servers).length === 0) {
-            this.log('No MCP servers found in config.');
+            this.log('No MCP servers found in config (checked mcpServers and mcp.servers).');
             return;
         }
 
@@ -114,39 +114,90 @@ export class McpClient {
         }
     }
 
+    /**
+     * Strip fields from JSON Schema that Gemini doesn't support
+     */
+    private _sanitizeSchema(schema: any): any {
+        if (!schema || typeof schema !== 'object') return schema;
+        if (Array.isArray(schema)) return schema.map(s => this._sanitizeSchema(s));
+
+        const clean: any = {};
+        for (const [key, value] of Object.entries(schema)) {
+            // Skip unsupported JSON Schema fields
+            if (['title', 'default', '$schema', 'additionalProperties', 'examples'].includes(key)) continue;
+
+            if (key === 'type' && value === 'integer') {
+                clean[key] = 'number'; // Gemini uses NUMBER not INTEGER
+            } else if (typeof value === 'object' && value !== null) {
+                clean[key] = this._sanitizeSchema(value);
+            } else {
+                clean[key] = value;
+            }
+        }
+        return clean;
+    }
+
     public getToolsForGemini(): any[] {
         const geminiTools: any[] = [];
         for (const [name, info] of this._tools) {
+            const cleanName = info.tool.name.replace(/[^a-zA-Z0-9_]/g, '_');
+            const rawSchema = info.tool.inputSchema || { type: 'object', properties: {} };
+            const schema = this._sanitizeSchema(rawSchema);
+
             geminiTools.push({
-                name: info.tool.name,
-                description: info.tool.description,
-                parameters: info.tool.inputSchema
+                name: cleanName,
+                description: (info.tool.description || '').trim(),
+                parameters: schema
             });
         }
         return geminiTools;
     }
 
     public async callTool(name: string, args: any): Promise<any> {
-        const info = this._tools.get(name);
+        // Find tool by name OR sanitized name
+        let info = this._tools.get(name);
+        if (!info) {
+            // Try to find by sanitized name
+            for (const [origName, i] of this._tools) {
+                const clean = origName.replace(/[^a-zA-Z0-9_]/g, '_');
+                if (clean === name) {
+                    info = i;
+                    break;
+                }
+            }
+        }
+
         if (!info) {
             throw new Error(`Tool ${name} not found.`);
         }
 
-        this.log(`Calling tool ${name} on server ${info.server}...`);
+        this.log(`Calling tool ${name} (original: ${info.tool.name}) on server ${info.server}...`);
         const client = this._clients.get(info.server);
         if (!client) {
             throw new Error(`Server ${info.server} not connected.`);
         }
 
         const result = await client.callTool({
-            name: name,
+            name: info.tool.name, // Use original name
             arguments: args
         });
 
-        // Format result for Gemini
-        // Gemini expects key "content" usually? or just JSON?
-        // The result from MCP SDK is usually { content: [...] }
-        return result;
+        // Convert MCP result to a simple string for Gemini functionResponse
+        // MCP returns { content: [{ type: "text", text: "..." }], isError?: boolean }
+        let textResult = '';
+        if (result?.content && Array.isArray(result.content)) {
+            textResult = result.content
+                .filter((c: any) => c.type === 'text')
+                .map((c: any) => c.text)
+                .join('\n');
+        } else if (typeof result === 'string') {
+            textResult = result;
+        } else {
+            textResult = JSON.stringify(result);
+        }
+
+        this.log(`Tool result: ${textResult.substring(0, 200)}`);
+        return { result: textResult };
     }
 
     public async dispose() {

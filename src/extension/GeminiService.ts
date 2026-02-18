@@ -43,7 +43,7 @@ const MODEL = 'gemini-2.5-flash';
 
 // ─── Types ────────────────────────────────────────────────────────────
 interface ChatMessage {
-    role: 'user' | 'model' | 'function';
+    role: 'user' | 'model';
     parts: { text?: string; functionCall?: any; functionResponse?: any }[];
 }
 
@@ -285,6 +285,7 @@ export class GeminiService extends EventEmitter {
                 }
 
                 log(`POST ${url} (project: ${this._projectId})`);
+                log(`Request body (turn ${turns}): ${JSON.stringify(body, null, 2).substring(0, 2000)}`);
 
                 const response = await this._fetchWithRetry(url, {
                     method: 'POST',
@@ -359,7 +360,7 @@ export class GeminiService extends EventEmitter {
 
                     const result = await this._processToolCall(toolCall);
                     this._history.push({
-                        role: 'function',
+                        role: 'user',
                         parts: [{
                             functionResponse: {
                                 name: toolCall.name,
@@ -439,7 +440,7 @@ export class GeminiService extends EventEmitter {
             this.emit('activity', `Executing ${call.name}...`);
             const args = call.args || {};
             const result = await this._mcpClient.callTool(call.name, args);
-            return { content: result };
+            return result;
         } catch (e: any) {
             log(`Tool execution failed: ${e.message}`);
             return { error: e.message };
