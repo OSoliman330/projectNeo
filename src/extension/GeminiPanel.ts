@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { spawn } from 'child_process';
+import * as path from 'path';
 
 export class GeminiPanel implements vscode.WebviewViewProvider {
     public static readonly viewType = 'geminiChat.view';
@@ -28,26 +29,74 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'sendMessage':
-                    this._runGemini(data.value);
+                    this._runGemini(data.value, data.attachments || []);
+                    break;
+                case 'attachFile':
+                    this._pickFile();
+                    break;
+                case 'attachFolder':
+                    this._pickFolder();
                     break;
             }
         });
     }
 
-    private _runGemini(prompt: string) {
+    private async _pickFile() {
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: true,
+            title: 'Select files to attach',
+        });
+        if (uris) {
+            for (const uri of uris) {
+                this._view?.webview.postMessage({
+                    type: 'fileSelected',
+                    value: {
+                        path: uri.fsPath,
+                        type: 'file',
+                        name: path.basename(uri.fsPath),
+                    },
+                });
+            }
+        }
+    }
+
+    private async _pickFolder() {
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: false,
+            canSelectFolders: true,
+            canSelectMany: true,
+            title: 'Select folders to attach',
+        });
+        if (uris) {
+            for (const uri of uris) {
+                this._view?.webview.postMessage({
+                    type: 'fileSelected',
+                    value: {
+                        path: uri.fsPath,
+                        type: 'folder',
+                        name: path.basename(uri.fsPath),
+                    },
+                });
+            }
+        }
+    }
+
+    private _runGemini(prompt: string, attachments: { path: string; type: string }[] = []) {
         if (!this._view) { return; }
 
         const config = vscode.workspace.getConfiguration('geminiChat');
         const cliPath = config.get<string>('cliPath') || 'gemini';
 
-        // Simple spawn executing: gemini "prompt"
-        // Adjust arguments based on actual CLI usage. Assuming `gemini <prompt>` or similar.
-        // If it requires interactive mode, we'd need a persistent process.
-        // For now, treating it as one-shot command for simplicity unless user specified otherwise.
-        // User request: "in the background it works with gemini CLI to send prompt to it and receive the response"
+        // Build full prompt with attachment context
+        let fullPrompt = prompt;
+        if (attachments.length > 0) {
+            const attachmentList = attachments.map(a => a.path).join(', ');
+            fullPrompt = `[Attached: ${attachmentList}] ${prompt}`;
+        }
 
-        // Attempting to stream output
-        const process = spawn(cliPath, [prompt], { shell: true });
+        const process = spawn(cliPath, [fullPrompt], { shell: true });
 
         process.stdout.on('data', (data) => {
             const output = data.toString();
