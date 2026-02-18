@@ -168,11 +168,13 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                 });
                 break;
 
+            case 'mcp':
+                this._geminiService?.send(`/${command} ${args || ''}`.trim());
+                break;
+
             default:
-                this._view?.webview.postMessage({
-                    type: 'systemMessage',
-                    value: `Unknown command: /${command}. Type /help for available commands.`,
-                });
+                // Forward unknown commands to service (might be handled there or sent to model)
+                this._geminiService?.send(`/${command} ${args || ''}`.trim());
                 break;
         }
     }

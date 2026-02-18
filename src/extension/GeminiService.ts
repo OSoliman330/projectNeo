@@ -22,6 +22,8 @@ function log(msg: string): void {
     getOutputChannel().appendLine(`[${ts}] ${msg}`);
 }
 
+import { McpClient } from './McpClient';
+
 // ─── Constants (from CLI source) ─────────────────────────────────────
 const OAUTH_CLIENT_ID = Buffer.from(
     'NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZT' +
@@ -41,8 +43,8 @@ const MODEL = 'gemini-2.5-flash';
 
 // ─── Types ────────────────────────────────────────────────────────────
 interface ChatMessage {
-    role: 'user' | 'model';
-    parts: { text: string }[];
+    role: 'user' | 'model' | 'function';
+    parts: { text?: string; functionCall?: any; functionResponse?: any }[];
 }
 
 /**
@@ -62,9 +64,11 @@ export class GeminiService extends EventEmitter {
     private _projectId: string | undefined;
     private _history: ChatMessage[] = [];
     private _initialized: boolean = false;
+    private _mcpClient: McpClient;
 
     constructor(_options: GeminiServiceOptions) {
         super();
+        this._mcpClient = new McpClient(getOutputChannel());
         log('Service created (Code Assist direct mode).');
     }
 
@@ -115,7 +119,10 @@ export class GeminiService extends EventEmitter {
                 }
             });
 
-            // 3. Get projectId from Code Assist (loadCodeAssist)
+            // 3. Start MCP Client
+            await this._mcpClient.start();
+
+            // 4. Get projectId from Code Assist (loadCodeAssist)
             this.emit('activity', 'Setting up Code Assist...');
             const envProject = process.env['GOOGLE_CLOUD_PROJECT'] || process.env['GOOGLE_CLOUD_PROJECT_ID'];
             this._projectId = await this._loadCodeAssist(envProject);
@@ -144,6 +151,37 @@ export class GeminiService extends EventEmitter {
         return token;
     }
 
+    private async _fetchWithRetry(url: string, options: RequestInit, retries = 3, backoff = 2000): Promise<Response> {
+        for (let i = 0; i <= retries; i++) {
+            try {
+                const res = await fetch(url, options);
+
+                if (res.status === 429) {
+                    if (i === retries) {
+                        log(`Rate limited (429). Max retries reached.`);
+                        return res; // let caller handle final failure
+                    }
+
+                    const retryAfter = res.headers.get('retry-after');
+                    const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : backoff * Math.pow(2, i);
+
+                    log(`Rate limited (429). Retrying in ${waitTime}ms... (Attempt ${i + 1}/${retries})`);
+                    this.emit('activity', `Rate limit hit. Retrying in ${Math.ceil(waitTime / 1000)}s...`);
+
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    continue;
+                }
+
+                return res;
+            } catch (err: any) {
+                if (i === retries) throw err;
+                // Only retry on typical network errors if needed, but here we focus on 429
+                throw err;
+            }
+        }
+        throw new Error('Unreachable');
+    }
+
     /**
      * Call loadCodeAssist to get the managed projectId
      */
@@ -152,7 +190,7 @@ export class GeminiService extends EventEmitter {
         const url = `${this._getBaseUrl()}:loadCodeAssist`;
 
         log(`POST ${url}`);
-        const res = await fetch(url, {
+        const res = await this._fetchWithRetry(url, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${token}`,
@@ -199,6 +237,11 @@ export class GeminiService extends EventEmitter {
             return false;
         }
 
+        if (prompt.startsWith('/')) {
+            const handled = await this._handleCommand(prompt);
+            if (handled) return true;
+        }
+
         if (!this._initialized) {
             await this.start();
             if (!this._initialized) { return false; }
@@ -212,94 +255,138 @@ export class GeminiService extends EventEmitter {
             // Add user message to history
             this._history.push({ role: 'user', parts: [{ text: prompt }] });
 
-            const token = await this._getAccessToken();
-            const url = `${this._getBaseUrl()}:streamGenerateContent?alt=sse`;
+            let keepGoing = true;
+            let turns = 0;
+            const MAX_TURNS = 5; // prevent infinite loops
 
-            // Build Code Assist request body (matches CLI's converter.js format)
-            const body = {
-                model: MODEL,
-                project: this._projectId,
-                user_prompt_id: `lite-agent-${Date.now()}`,
-                request: {
-                    contents: this._history,
-                },
-            };
+            while (keepGoing && turns < MAX_TURNS) {
+                turns++;
+                keepGoing = false; // default to stop unless tool call
 
-            log(`POST ${url} (project: ${this._projectId})`);
+                const token = await this._getAccessToken();
+                const url = `${this._getBaseUrl()}:streamGenerateContent?alt=sse`;
 
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify(body),
-            });
+                // Build Code Assist request body
+                const body: any = {
+                    model: MODEL,
+                    project: this._projectId,
+                    user_prompt_id: `lite-agent-${Date.now()}`,
+                    request: {
+                        contents: this._history,
+                    },
+                };
 
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`API error ${response.status}: ${errorText.substring(0, 300)}`);
-            }
+                // Add tools if available
+                const tools = this._mcpClient.getToolsForGemini();
+                if (tools.length > 0) {
+                    body.request.tools = [{
+                        functionDeclarations: tools
+                    }];
+                }
 
-            log('Streaming response...');
-            let fullText = '';
+                log(`POST ${url} (project: ${this._projectId})`);
 
-            // Parse SSE stream
-            const reader = response.body?.getReader();
-            if (!reader) { throw new Error('No response body'); }
+                const response = await this._fetchWithRetry(url, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(body),
+                });
 
-            const decoder = new TextDecoder();
-            let buffer = '';
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`API error ${response.status}: ${errorText.substring(0, 300)}`);
+                }
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) { break; }
+                log('Streaming response...');
+                let fullText = '';
+                let toolCall: any = null;
 
-                buffer += decoder.decode(value, { stream: true });
+                // Parse SSE stream
+                const reader = response.body?.getReader();
+                if (!reader) { throw new Error('No response body'); }
 
-                // Process complete SSE events
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
+                const decoder = new TextDecoder();
+                let buffer = '';
 
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        const jsonStr = line.slice(6).trim();
-                        if (!jsonStr || jsonStr === '[DONE]') { continue; }
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) { break; }
 
-                        try {
-                            const data = JSON.parse(jsonStr);
-                            // Code Assist wraps response: { response: { candidates: [...] } }
-                            const candidates = data?.response?.candidates || data?.candidates;
-                            const text = candidates?.[0]?.content?.parts?.[0]?.text;
-                            if (text) {
-                                fullText += text;
-                                this.emit('data', text);
+                    buffer += decoder.decode(value, { stream: true });
+
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const jsonStr = line.slice(6).trim();
+                            if (!jsonStr || jsonStr === '[DONE]') { continue; }
+
+                            try {
+                                const data = JSON.parse(jsonStr);
+                                const candidates = data?.response?.candidates || data?.candidates;
+                                const content = candidates?.[0]?.content;
+                                const part = content?.parts?.[0];
+
+                                if (part?.text) {
+                                    fullText += part.text;
+                                    this.emit('data', part.text);
+                                } else if (part?.functionCall) {
+                                    toolCall = part.functionCall;
+                                    log(`Tool call received: ${toolCall.name}`);
+                                }
+                            } catch (parseErr: any) {
+                                log(`SSE parse warning: ${parseErr.message}`);
                             }
-                        } catch (parseErr: any) {
-                            log(`SSE parse warning: ${parseErr.message}`);
                         }
                     }
                 }
-            }
 
-            // Add assistant response to history
-            if (fullText) {
-                this._history.push({ role: 'model', parts: [{ text: fullText }] });
+                // Add assistant response to history
+                if (fullText) {
+                    this._history.push({ role: 'model', parts: [{ text: fullText }] });
+                }
+
+                // Handle tool call
+                if (toolCall) {
+                    this._history.push({
+                        role: 'model',
+                        parts: [{ functionCall: toolCall }]
+                    });
+
+                    const result = await this._processToolCall(toolCall);
+                    this._history.push({
+                        role: 'function',
+                        parts: [{
+                            functionResponse: {
+                                name: toolCall.name,
+                                response: result
+                            }
+                        }]
+                    });
+
+                    keepGoing = true; // Loop to send tool result back to model
+                    this.emit('activity', `Function ${toolCall.name} executed. Sending result...`);
+                } else {
+                    this.emit('responseComplete');
+                }
             }
 
             const sec = ((Date.now() - startTime) / 1000).toFixed(1);
-            log(`Done. ${fullText.length} chars in ${sec}s`);
+            log(`Done. ${turns} turns in ${sec}s`);
             this.emit('activity', `✅ Done in ${sec}s`);
-            this.emit('responseComplete');
 
         } catch (err: any) {
             log(`API error: ${err.message}`);
-            this._history.pop(); // Remove failed user message
+            // Don't pop history blindly, might lose context. Just log.
 
             if (err.message?.includes('401') || err.message?.includes('403')) {
                 this._initialized = false;
                 this._oauthClient = null;
-                this.emit('error', `Auth error. Try sending again. (${err.message})`);
+                this.emit('error', `Auth error. Please retry. (${err.message})`);
             } else {
                 this.emit('error', err.message || 'Unknown API error');
             }
@@ -308,6 +395,55 @@ export class GeminiService extends EventEmitter {
         }
 
         return true;
+    }
+
+    private async _handleCommand(prompt: string): Promise<boolean> {
+        const [cmd, ...args] = prompt.trim().split(/\s+/);
+
+        switch (cmd.toLowerCase()) {
+            case '/clear':
+                this.restart();
+                return true;
+            case '/restart':
+                this.restart();
+                // verify config again?
+                await this.start();
+                return true;
+            case '/status':
+                this.emit('data', `Status: Connected\nProject: ${this._projectId}\nHistory: ${this._history.length} messages\n`);
+                this.emit('responseComplete');
+                return true;
+            case '/help':
+                this.emit('data', `Commands:\n/clear - Clear chat\n/restart - Restart session\n/status - Show connection status\n/mcp list - List MCP tools\n`);
+                this.emit('responseComplete');
+                return true;
+            case '/mcp':
+                if (args[0] === 'list') {
+                    const tools = this._mcpClient.getToolsForGemini();
+                    const list = tools.map(t => `- **${t.name}**: ${t.description}`).join('\n');
+                    this.emit('data', `MCP Tools:\n${list || 'No tools found.'}`);
+                    this.emit('responseComplete');
+                    return true;
+                }
+                this.emit('data', 'Usage: `/mcp list`\nManage Model Context Protocol (MCP) servers and tools.');
+                this.emit('responseComplete');
+                return true;
+            default:
+                return false; // treat as prompt
+        }
+    }
+
+    private async _processToolCall(call: any): Promise<any> {
+        try {
+            log(`Executing tool ${call.name} with args: ${JSON.stringify(call.args)}`);
+            this.emit('activity', `Executing ${call.name}...`);
+            const args = call.args || {};
+            const result = await this._mcpClient.callTool(call.name, args);
+            return { content: result };
+        } catch (e: any) {
+            log(`Tool execution failed: ${e.message}`);
+            return { error: e.message };
+        }
     }
 
     /**

@@ -74,6 +74,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.41.0",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "@tailwindcss/postcss": "^4.1.18",
     "google-auth-library": "^10.5.0",
     "lucide-react": "^0.574.0",
