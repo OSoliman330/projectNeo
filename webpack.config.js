@@ -51,7 +51,9 @@ const extensionConfig = {
         ],
     },
     externals: {
-        vscode: 'commonjs vscode', // Ignored because it's provided by the host
+        vscode: 'commonjs vscode',
+        '@google/genai': 'commonjs @google/genai',
+        'google-auth-library': 'commonjs google-auth-library',
     },
     devtool: 'source-map',
 };

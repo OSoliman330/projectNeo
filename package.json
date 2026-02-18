@@ -1,7 +1,7 @@
 {
-  "name": "gemini-chat-extension",
-  "displayName": "Gemini Chat",
-  "description": "Rich chat interface for Gemini CLI",
+  "name": "lite-agent",
+  "displayName": "Lite Agent",
+  "description": "Rich AI chat interface powered by CLI",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.80.0"
@@ -16,14 +16,14 @@
     "commands": [
       {
         "command": "geminiChat.open",
-        "title": "Open Gemini Chat"
+        "title": "Open Lite Agent"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "gemini-chat-sidebar",
-          "title": "Gemini Chat",
+          "title": "Lite Agent",
           "icon": "media/icon.svg"
         }
       ]
@@ -33,17 +33,17 @@
         {
           "type": "webview",
           "id": "geminiChat.view",
-          "name": "Gemini Chat"
+          "name": "Lite Agent"
         }
       ]
     },
     "configuration": {
-      "title": "Gemini Chat",
+      "title": "Lite Agent",
       "properties": {
         "geminiChat.cliPath": {
           "type": "string",
           "default": "gemini",
-          "description": "Path to the Gemini CLI executable"
+          "description": "Path to the CLI executable"
         }
       }
     }
@@ -61,6 +61,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.109.0",
     "autoprefixer": "^10.4.24",
+    "copy-webpack-plugin": "^13.0.1",
     "css-loader": "^7.1.4",
     "postcss": "^8.5.6",
     "postcss-loader": "^8.2.1",
@@ -72,7 +73,9 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
+    "@google/genai": "^1.41.0",
     "@tailwindcss/postcss": "^4.1.18",
+    "google-auth-library": "^10.5.0",
     "lucide-react": "^0.574.0",
     "marked": "^17.0.3",
     "react": "^19.2.4",

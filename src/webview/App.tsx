@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Bot, User, Loader2, Paperclip, File, Folder, X } from 'lucide-react';
+import { Send, Bot, User, Loader2, Paperclip, File, Folder, X, Zap, ChevronDown, ChevronRight, Activity } from 'lucide-react';
 import { vscode } from './vscode-api';
 import { marked } from 'marked';
 
@@ -11,20 +11,24 @@ interface Attachment {
 
 interface Message {
     id: string;
-    role: 'user' | 'model';
+    role: 'user' | 'model' | 'system';
     content: string;
     attachments?: Attachment[];
 }
+
+const SLASH_COMMANDS = ['/clear', '/restart', '/status', '/help'];
 
 const App: React.FC = () => {
     const [input, setInput] = useState('');
     const [messages, setMessages] = useState<Message[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
+    const [connectionStatus, setConnectionStatus] = useState<string>('connecting');
+    const [activitySteps, setActivitySteps] = useState<string[]>([]);
+    const [showActivity, setShowActivity] = useState(true);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        // Listen for messages from the extension
         const handleMessage = (event: MessageEvent) => {
             const message = event.data;
             switch (message.type) {
@@ -32,6 +36,7 @@ const App: React.FC = () => {
                     setMessages(prev => [...prev, { id: Date.now().toString(), role: 'model', content: message.value }]);
                     setIsLoading(false);
                     break;
+
                 case 'streamMessage':
                     setMessages(prev => {
                         const last = prev[prev.length - 1];
@@ -43,6 +48,30 @@ const App: React.FC = () => {
                     });
                     setIsLoading(false);
                     break;
+
+                case 'responseComplete':
+                    setIsLoading(false);
+                    break;
+
+                case 'systemMessage':
+                    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'system', content: message.value }]);
+                    setIsLoading(false);
+                    break;
+
+                case 'clearChat':
+                    setMessages([]);
+                    setActivitySteps([]);
+                    setIsLoading(false);
+                    break;
+
+                case 'statusUpdate':
+                    setConnectionStatus(message.value);
+                    break;
+
+                case 'activityStep':
+                    setActivitySteps(prev => [...prev, message.value]);
+                    break;
+
                 case 'fileSelected':
                     setAttachments(prev => {
                         if (prev.find(a => a.path === message.value.path)) return prev;
@@ -61,7 +90,24 @@ const App: React.FC = () => {
     }, [messages]);
 
     const handleSend = () => {
-        if (!input.trim() && attachments.length === 0) return;
+        const trimmed = input.trim();
+        if (!trimmed && attachments.length === 0) return;
+
+        // Check for slash commands
+        if (trimmed.startsWith('/')) {
+            const parts = trimmed.split(' ');
+            const command = parts[0].slice(1); // remove the /
+            const args = parts.slice(1).join(' ');
+
+            // Show the command in chat
+            setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', content: trimmed }]);
+            vscode.postMessage({ type: 'slashCommand', command, args });
+            setInput('');
+            return;
+        }
+
+        // Clear activity steps for new message
+        setActivitySteps([]);
 
         const userMessage: Message = {
             id: Date.now().toString(),
@@ -99,16 +145,31 @@ const App: React.FC = () => {
         }
     };
 
+    const statusDot = connectionStatus === 'connected'
+        ? 'bg-emerald-400 shadow-emerald-400/50'
+        : connectionStatus === 'connecting'
+            ? 'bg-amber-400 shadow-amber-400/50 animate-pulse'
+            : 'bg-red-400 shadow-red-400/50';
+
+    const statusText = connectionStatus === 'connected'
+        ? 'Connected'
+        : connectionStatus === 'connecting'
+            ? 'Connecting...'
+            : 'Disconnected';
+
     return (
         <div className="flex flex-col h-screen bg-[#0d1117] text-gray-100 font-sans overflow-hidden">
             {/* Header */}
             <header className="px-6 py-4 bg-[#161b22] border-b border-[#30363d] flex items-center gap-3 shadow-lg z-10">
-                <div className="p-2 bg-blue-500/10 rounded-lg">
-                    <Bot className="w-6 h-6 text-blue-400" />
+                <div className="p-2 bg-gradient-to-br from-blue-500/20 to-purple-500/20 rounded-lg border border-blue-500/20">
+                    <Zap className="w-5 h-5 text-blue-400" />
                 </div>
-                <div>
-                    <h1 className="font-bold text-lg tracking-tight bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Gemini Chat</h1>
-                    <div className="text-[10px] text-gray-400 uppercase tracking-wider font-medium">Always Active</div>
+                <div className="flex-1">
+                    <h1 className="font-bold text-lg tracking-tight bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Lite Agent</h1>
+                    <div className="flex items-center gap-1.5">
+                        <div className={`w-1.5 h-1.5 rounded-full shadow-sm ${statusDot}`}></div>
+                        <span className="text-[10px] text-gray-400 uppercase tracking-wider font-medium">{statusText}</span>
+                    </div>
                 </div>
             </header>
 
@@ -116,57 +177,95 @@ const App: React.FC = () => {
             <div className="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth custom-scrollbar">
                 {messages.length === 0 && (
                     <div className="h-full flex flex-col items-center justify-center text-gray-500 opacity-50 select-none">
-                        <Bot size={48} className="mb-4 text-gray-600" />
-                        <p>Start a conversation with Gemini</p>
+                        <Zap size={48} className="mb-4 text-gray-600" />
+                        <p className="text-sm">Start a conversation with Lite Agent</p>
+                        <p className="text-xs mt-2 text-gray-600">Type /help for available commands</p>
                     </div>
                 )}
 
-                {messages.map((msg) => (
-                    <div
-                        key={msg.id}
-                        className={`flex gap-4 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'} animate-in fade-in slide-in-from-bottom-2 duration-300`}
-                    >
-                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 shadow-lg ${msg.role === 'user'
-                            ? 'bg-blue-600 shadow-blue-900/20'
-                            : 'bg-gradient-to-br from-emerald-500 to-teal-600 shadow-emerald-900/20'
-                            }`}>
-                            {msg.role === 'user' ? <User size={20} className="text-white" /> : <Bot size={20} className="text-white" />}
-                        </div>
-
-                        <div
-                            className={`max-w-[85%] p-4 rounded-2xl shadow-md text-sm leading-7 ${msg.role === 'user'
-                                ? 'bg-blue-600 text-white rounded-tr-md'
-                                : 'bg-[#161b22] text-gray-300 border border-[#30363d] rounded-tl-md'
-                                }`}
-                        >
-                            {msg.attachments && msg.attachments.length > 0 && (
-                                <div className="flex flex-wrap gap-2 mb-2">
-                                    {msg.attachments.map((att, i) => (
-                                        <span key={i} className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/10 text-xs font-medium border border-white/10">
-                                            {att.type === 'file' ? <File size={12} /> : <Folder size={12} />}
-                                            {att.name}
-                                        </span>
-                                    ))}
+                {messages.map((msg) => {
+                    // System messages
+                    if (msg.role === 'system') {
+                        return (
+                            <div key={msg.id} className="flex justify-center">
+                                <div className="max-w-[90%] px-4 py-2.5 rounded-xl bg-[#1c2333] border border-[#30363d] text-xs text-gray-400 text-center">
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body system-msg" />
                                 </div>
-                            )}
-                            {msg.role === 'model' ? (
-                                <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body" />
-                            ) : (
-                                <div className="whitespace-pre-wrap font-medium">{msg.content}</div>
-                            )}
+                            </div>
+                        );
+                    }
+
+                    return (
+                        <div
+                            key={msg.id}
+                            className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
+                        >
+                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 shadow-md ${msg.role === 'user'
+                                ? 'bg-blue-600 shadow-blue-900/20'
+                                : 'bg-gradient-to-br from-emerald-500 to-teal-600 shadow-emerald-900/20'
+                                }`}>
+                                {msg.role === 'user' ? <User size={16} className="text-white" /> : <Zap size={16} className="text-white" />}
+                            </div>
+
+                            <div
+                                className={`max-w-[85%] p-3.5 rounded-2xl shadow-md text-sm leading-7 ${msg.role === 'user'
+                                    ? 'bg-blue-600 text-white rounded-tr-md'
+                                    : 'bg-[#161b22] text-gray-300 border border-[#30363d] rounded-tl-md'
+                                    }`}
+                            >
+                                {msg.attachments && msg.attachments.length > 0 && (
+                                    <div className="flex flex-wrap gap-1.5 mb-2">
+                                        {msg.attachments.map((att, i) => (
+                                            <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/10 text-[11px] font-medium border border-white/10">
+                                                {att.type === 'file' ? <File size={10} /> : <Folder size={10} />}
+                                                {att.name}
+                                            </span>
+                                        ))}
+                                    </div>
+                                )}
+                                {msg.role === 'model' ? (
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body" />
+                                ) : (
+                                    <div className="whitespace-pre-wrap font-medium">{msg.content}</div>
+                                )}
+                            </div>
                         </div>
-                    </div>
-                ))}
+                    );
+                })}
 
                 {isLoading && (
-                    <div className="flex gap-4 animate-pulse">
-                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500/50 to-teal-600/50 flex items-center justify-center shrink-0">
-                            <Bot size={20} className="text-white/50" />
+                    <div className="flex gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500/50 to-teal-600/50 flex items-center justify-center shrink-0">
+                            <Zap size={16} className="text-white/50" />
                         </div>
-                        <div className="bg-[#161b22] border border-[#30363d] p-4 rounded-2xl rounded-tl-md flex items-center gap-2">
-                            <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
+                        <div className="bg-[#161b22] border border-[#30363d] px-4 py-3 rounded-2xl rounded-tl-md flex items-center gap-2">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
                             <span className="text-xs text-gray-400">Thinking...</span>
                         </div>
+                    </div>
+                )}
+
+                {/* Activity Steps */}
+                {activitySteps.length > 0 && (
+                    <div className="ml-11">
+                        <button
+                            onClick={() => setShowActivity(!showActivity)}
+                            className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors mb-1.5"
+                        >
+                            {showActivity ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                            <Activity size={12} />
+                            <span>{activitySteps.length} step{activitySteps.length !== 1 ? 's' : ''}</span>
+                        </button>
+                        {showActivity && (
+                            <div className="border-l-2 border-[#30363d] pl-3 space-y-1">
+                                {activitySteps.map((step, i) => (
+                                    <div key={i} className="text-[11px] text-gray-500 font-mono leading-5 flex items-start gap-2">
+                                        <span className="text-gray-600 select-none shrink-0">{i + 1}.</span>
+                                        <span className="break-all">{step}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 )}
                 <div ref={messagesEndRef} />
@@ -220,7 +319,7 @@ const App: React.FC = () => {
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
-                            placeholder="Type a message..."
+                            placeholder="Type a message or /help..."
                             className="w-full bg-transparent text-gray-200 p-4 pl-0 min-h-[60px] max-h-[200px] outline-none resize-none placeholder-gray-500 font-medium"
                             rows={1}
                             style={{ height: 'auto' }}
@@ -235,14 +334,14 @@ const App: React.FC = () => {
                     </div>
                 </div>
                 <div className="text-[10px] text-center text-gray-600 mt-3 font-medium tracking-wide">
-                    POWERED BY GEMINI CLI
+                    POWERED BY CLI
                 </div>
             </div>
         </div>
     );
 };
 
-// Add basic markdown styles if not present in tailwind reset
+// Markdown styles
 const markdownStyles = `
 .markdown-body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
 .markdown-body p { margin-bottom: 0.75em; }
@@ -260,6 +359,8 @@ const markdownStyles = `
 .markdown-body table { border-collapse: collapse; width: 100%; margin: 1em 0; }
 .markdown-body th, .markdown-body td { border: 1px solid #30363d; padding: 0.5em; }
 .markdown-body th { background: #161b22; }
+.system-msg .markdown-body p { margin-bottom: 0.25em; }
+.system-msg code { font-size: 0.9em; }
 `;
 
 export default App;

@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
-import { spawn } from 'child_process';
 import * as path from 'path';
+import { GeminiService } from './GeminiService';
 
 export class GeminiPanel implements vscode.WebviewViewProvider {
     public static readonly viewType = 'geminiChat.view';
     private _view?: vscode.WebviewView;
+    private _geminiService?: GeminiService;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -19,17 +20,19 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
 
         webviewView.webview.options = {
             enableScripts: true,
-            localResourceRoots: [
-                this._extensionUri
-            ]
+            localResourceRoots: [this._extensionUri]
         };
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
+        // Start the persistent CLI process immediately
+        this._initGeminiService();
+
+        // Handle messages from webview
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'sendMessage':
-                    this._runGemini(data.value, data.attachments || []);
+                    this._handleUserMessage(data.value, data.attachments || []);
                     break;
                 case 'attachFile':
                     this._pickFile();
@@ -37,9 +40,146 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                 case 'attachFolder':
                     this._pickFolder();
                     break;
+                case 'slashCommand':
+                    this._handleSlashCommand(data.command, data.args);
+                    break;
             }
         });
+
+        // Cleanup when view is disposed
+        webviewView.onDidDispose(() => {
+            this._geminiService?.dispose();
+        });
     }
+
+    /*─────────────────────────────────────────────────
+     * Gemini SDK Service (direct API, no CLI spawn)
+     *────────────────────────────────────────────────*/
+
+    private _initGeminiService() {
+        this._geminiService = new GeminiService({ cliPath: '' });
+
+        // Stream data chunks to the webview in real-time
+        this._geminiService.on('data', (chunk: string) => {
+            this._view?.webview.postMessage({ type: 'streamMessage', value: chunk });
+        });
+
+        // When a full response is complete
+        this._geminiService.on('responseComplete', () => {
+            this._view?.webview.postMessage({ type: 'responseComplete' });
+        });
+
+        // Activity steps
+        this._geminiService.on('activity', (text: string) => {
+            this._view?.webview.postMessage({
+                type: 'activityStep',
+                value: text,
+            });
+        });
+
+        // Status updates
+        this._geminiService.on('status', (status: string) => {
+            this._view?.webview.postMessage({ type: 'statusUpdate', value: status });
+        });
+
+        // Errors
+        this._geminiService.on('error', (message: string) => {
+            this._view?.webview.postMessage({
+                type: 'streamMessage',
+                value: `\n⚠️ *${message}*\n`,
+            });
+            this._view?.webview.postMessage({ type: 'responseComplete' });
+        });
+
+        // Start SDK (async, fires 'status' and 'activity' events)
+        void this._geminiService.start();
+    }
+
+    /*─────────────────────────────────────────────────
+     * Message Handling
+     *────────────────────────────────────────────────*/
+
+    private async _handleUserMessage(prompt: string, attachments: { path: string; type: string }[]) {
+        if (!this._geminiService) {
+            this._initGeminiService();
+        }
+
+        // Build full prompt with attachment context
+        let fullPrompt = prompt;
+        if (attachments.length > 0) {
+            const attachmentList = attachments.map(a => a.path).join(', ');
+            fullPrompt = `[Attached: ${attachmentList}] ${prompt}`;
+        }
+
+        await this._geminiService!.send(fullPrompt);
+    }
+
+    /*─────────────────────────────────────────────────
+     * Slash Commands
+     *────────────────────────────────────────────────*/
+
+    private _handleSlashCommand(command: string, args?: string) {
+        switch (command) {
+            case 'clear':
+                // Restart the process to clear context
+                this._geminiService?.restart();
+                this._view?.webview.postMessage({ type: 'clearChat' });
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: '🔄 Context cleared. Starting fresh session.',
+                });
+                break;
+
+            case 'restart':
+                this._geminiService?.restart();
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: '🔄 CLI process restarted.',
+                });
+                break;
+
+            case 'status':
+                const status = this._geminiService?.isReady ? '🟢 Connected' : '🔴 Disconnected';
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: `Status: ${status}`,
+                });
+                break;
+
+            case 'help':
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: [
+                        '📋 **Available Commands:**',
+                        '`/clear` — Clear chat and reset context',
+                        '`/restart` — Restart CLI process',
+                        '`/status` — Show connection status',
+                        '`/log` — Open debug log output',
+                        '`/help` — Show this help message',
+                    ].join('\n'),
+                });
+                break;
+
+            case 'log':
+                this._geminiService?.showLog();
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: '📄 Output channel opened. Check the "Lite Agent" tab in the Output panel.',
+                });
+                break;
+
+            default:
+                this._view?.webview.postMessage({
+                    type: 'systemMessage',
+                    value: `Unknown command: /${command}. Type /help for available commands.`,
+                });
+                break;
+        }
+    }
+
+    /*─────────────────────────────────────────────────
+     * File / Folder Picker
+     *────────────────────────────────────────────────*/
 
     private async _pickFile() {
         const uris = await vscode.window.showOpenDialog({
@@ -83,47 +223,12 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
         }
     }
 
-    private _runGemini(prompt: string, attachments: { path: string; type: string }[] = []) {
-        if (!this._view) { return; }
-
-        const config = vscode.workspace.getConfiguration('geminiChat');
-        const cliPath = config.get<string>('cliPath') || 'gemini';
-
-        // Build full prompt with attachment context
-        let fullPrompt = prompt;
-        if (attachments.length > 0) {
-            const attachmentList = attachments.map(a => a.path).join(', ');
-            fullPrompt = `[Attached: ${attachmentList}] ${prompt}`;
-        }
-
-        const process = spawn(cliPath, [fullPrompt], { shell: true });
-
-        process.stdout.on('data', (data) => {
-            const output = data.toString();
-            this._view?.webview.postMessage({ type: 'streamMessage', value: output });
-        });
-
-        process.stderr.on('data', (data) => {
-            console.error(`Gemini CLI Error: ${data}`);
-            // meaningful errors could be sent to UI
-        });
-
-        process.on('close', (code) => {
-            if (code !== 0) {
-                this._view?.webview.postMessage({ type: 'streamMessage', value: '\n*[Process exited with code ' + code + ']*' });
-            }
-            // ensure we might signal end of stream if needed, but current UI handles appends
-        });
-
-        process.on('error', (err) => {
-            this._view?.webview.postMessage({ type: 'streamMessage', value: `\n*Error launching Gemini CLI: ${err.message}*` });
-        });
-    }
+    /*─────────────────────────────────────────────────
+     * Webview HTML
+     *────────────────────────────────────────────────*/
 
     private _getHtmlForWebview(webview: vscode.Webview) {
         const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'dist', 'webview.js'));
-
-        // Use a nonce to only allow specific scripts to be run
         const nonce = getNonce();
 
         return `<!DOCTYPE html>
@@ -132,7 +237,7 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
         <meta charset="UTF-8">
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' 'unsafe-eval'; img-src ${webview.cspSource} https: data:;">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Gemini Chat</title>
+        <title>Lite Agent</title>
       </head>
       <body>
         <div id="root"></div>
@@ -141,10 +246,9 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                 const root = document.getElementById('root');
                 root.innerHTML += '<div style="color: red; padding: 10px; border: 1px solid red; margin: 10px;">' +
                     '<h3>Webview Error</h3>' +
-                    '<pre>' + message + '\n' + source + ':' + lineno + '</pre>' +
+                    '<pre>' + message + '\\n' + source + ':' + lineno + '</pre>' +
                     '</div>';
             };
-            console.log('Webview script loaded');
         </script>
         <script nonce="${nonce}" src="${scriptUri}"></script>
       </body>
