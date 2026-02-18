@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+
+/* Custom Scrollbar for VS Code Webview */
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vscode-scrollbarSlider-background);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vscode-scrollbarSlider-hoverBackground);
+}
+
+::-webkit-scrollbar-track {
+  background: var(--vscode-editor-background);
+}
