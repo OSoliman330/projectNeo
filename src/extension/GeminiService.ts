@@ -299,7 +299,11 @@ export class GeminiService extends EventEmitter {
             const allSkills = manager.getAllSkills();
             const projectRoot = this._config.getProjectRoot();
 
-            let debugMsg = `\n\n🔍 **Debug Skills**:\n- Project Root: \`${projectRoot}\`\n- Total Skills Found: ${allSkills.length}\n- Displayable: ${skills.length}`;
+            const skillDetails = allSkills.map((s: any) =>
+                `Value: ${s.name} | Disabled: ${s.disabled} | Builtin: ${s.isBuiltin} | Loc: ${s.location}`
+            ).join('\n');
+
+            let debugMsg = `\n\n🔍 **Debug Skills**:\n- Project Root: \`${projectRoot}\`\n- Total: ${allSkills.length}\n- Displayable: ${skills.length}\n- Details:\n${skillDetails}`;
 
             if (skills.length === 0) {
                 this.emit('data', `\n\n🧩 **Skills**: No user skills found.${debugMsg}`);
