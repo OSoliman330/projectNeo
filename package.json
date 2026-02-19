@@ -73,6 +73,7 @@
     "webpack-cli": "^6.0.1"
   },
   "dependencies": {
+    "@google/gemini-cli": "^0.28.2",
     "@google/genai": "^1.41.0",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@tailwindcss/postcss": "^4.1.18",

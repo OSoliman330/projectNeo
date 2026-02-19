@@ -1,5 +1,6 @@
+
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Bot, User, Loader2, Paperclip, File, Folder, X, Zap, ChevronDown, ChevronRight, Activity } from 'lucide-react';
+import { Send, Bot, User, Loader2, Paperclip, File, Folder, X, Zap, ChevronDown, ChevronRight, Activity, Terminal, RefreshCw, Server, Cpu, FileText, HelpCircle, StopCircle, Octagon, Check, ShieldCheck, ShieldAlert, Ban } from 'lucide-react';
 import { vscode } from './vscode-api';
 import { marked } from 'marked';
 
@@ -16,7 +17,23 @@ interface Message {
     attachments?: Attachment[];
 }
 
-const SLASH_COMMANDS = ['/clear', '/restart', '/status', '/help'];
+interface AuthorizationRequest {
+    toolName: string;
+    args: any;
+}
+
+const COMMANDS = [
+    { name: '/clear', description: 'Clear chat history', icon: Terminal },
+    { name: '/restart', description: 'Restart agent process', icon: RefreshCw },
+    { name: '/status', description: 'Connection status', icon: Activity },
+    { name: '/mcp', description: 'List MCP servers', icon: Server },
+    { name: '/tools', description: 'List tools', icon: Cpu },
+    { name: '/log', description: 'View logs', icon: FileText },
+    { name: '/help', description: 'Show help', icon: HelpCircle },
+    { name: '/debug', description: 'Debug chat history', icon: Zap },
+    { name: '/agents', description: 'List available agents', icon: Bot },
+    { name: '/skills', description: 'List available skills', icon: FileText },
+];
 
 const App: React.FC = () => {
     const [input, setInput] = useState('');
@@ -26,9 +43,21 @@ const App: React.FC = () => {
     const [connectionStatus, setConnectionStatus] = useState<string>('connecting');
     const [activitySteps, setActivitySteps] = useState<string[]>([]);
     const [showActivity, setShowActivity] = useState(true);
+    const [authRequest, setAuthRequest] = useState<AuthorizationRequest | null>(null);
+
+    // Slash command menu state
+    const [showCommandMenu, setShowCommandMenu] = useState(false);
+    const [filteredCommands, setFilteredCommands] = useState(COMMANDS);
+    const [selectedIndex, setSelectedIndex] = useState(0);
+
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    // Ref for the selected command item to scroll into view
+    const selectedCommandRef = useRef<HTMLButtonElement>(null);
 
     useEffect(() => {
+        // Notify extension that webview is ready to receive status
+        vscode.postMessage({ type: 'webviewReady' });
+
         const handleMessage = (event: MessageEvent) => {
             const message = event.data;
             switch (message.type) {
@@ -78,6 +107,12 @@ const App: React.FC = () => {
                         return [...prev, message.value];
                     });
                     break;
+
+                case 'requestAuthorization':
+                    setActivitySteps(prev => [...prev, `Waiting for approval: ${message.value.toolName}`]);
+                    setAuthRequest(message.value);
+                    setIsLoading(true); // Ensure loading state is active while waiting
+                    break;
             }
         };
 
@@ -87,7 +122,32 @@ const App: React.FC = () => {
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+    }, [messages, authRequest, activitySteps]);
+
+    // Update command menu when input changes
+    useEffect(() => {
+        if (input.startsWith('/')) {
+            const searchTerm = input.toLowerCase();
+            const filtered = COMMANDS.filter(cmd =>
+                cmd.name.toLowerCase().startsWith(searchTerm)
+            );
+            setFilteredCommands(filtered);
+            setSelectedIndex(0);
+            setShowCommandMenu(filtered.length > 0);
+        } else {
+            setShowCommandMenu(false);
+        }
+    }, [input]);
+
+    // Scroll selected command into view when selection changes
+    useEffect(() => {
+        if (showCommandMenu && selectedCommandRef.current) {
+            selectedCommandRef.current.scrollIntoView({
+                block: 'nearest',
+                behavior: 'smooth'
+            });
+        }
+    }, [selectedIndex, showCommandMenu]);
 
     const handleSend = () => {
         const trimmed = input.trim();
@@ -103,6 +163,7 @@ const App: React.FC = () => {
             setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', content: trimmed }]);
             vscode.postMessage({ type: 'slashCommand', command, args });
             setInput('');
+            setShowCommandMenu(false);
             return;
         }
 
@@ -124,6 +185,31 @@ const App: React.FC = () => {
         setInput('');
         setAttachments([]);
         setIsLoading(true);
+        setShowCommandMenu(false);
+    };
+
+    const handleStop = () => {
+        vscode.postMessage({ type: 'stop' });
+        setIsLoading(false);
+        setAuthRequest(null);
+        setActivitySteps(prev => [...prev, '🛑 Execution stopped by user.']);
+    };
+
+    const handleAuthorization = (decision: 'once' | 'session' | 'deny') => {
+        if (!authRequest) return;
+
+        vscode.postMessage({
+            type: 'authorizationResponse',
+            decision,
+            toolName: authRequest.toolName
+        });
+
+        setAuthRequest(null);
+        if (decision === 'deny') {
+            setActivitySteps(prev => [...prev, `🚫 Denied: ${authRequest.toolName}`]);
+        } else {
+            setActivitySteps(prev => [...prev, `✅ Approved: ${authRequest.toolName} (${decision === 'session' ? 'always' : 'once'})`]);
+        }
     };
 
     const handleAttachFile = () => {
@@ -139,47 +225,80 @@ const App: React.FC = () => {
     };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
+        if (showCommandMenu) {
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSelectedIndex(prev => (prev > 0 ? prev - 1 : filteredCommands.length - 1));
+                return;
+            }
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSelectedIndex(prev => (prev < filteredCommands.length - 1 ? prev + 1 : 0));
+                return;
+            }
+            if (e.key === 'Enter' || e.key === 'Tab') {
+                e.preventDefault();
+                const selected = filteredCommands[selectedIndex];
+                if (selected) {
+                    setInput(selected.name + ' ');
+                    setShowCommandMenu(false);
+                }
+                return;
+            }
+            if (e.key === 'Escape') {
+                setShowCommandMenu(false);
+                return;
+            }
+        }
+
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             handleSend();
         }
     };
 
-    const statusDot = connectionStatus === 'connected'
-        ? 'bg-emerald-400 shadow-emerald-400/50'
-        : connectionStatus === 'connecting'
-            ? 'bg-amber-400 shadow-amber-400/50 animate-pulse'
-            : 'bg-red-400 shadow-red-400/50';
-
-    const statusText = connectionStatus === 'connected'
-        ? 'Connected'
-        : connectionStatus === 'connecting'
-            ? 'Connecting...'
-            : 'Disconnected';
+    const isConnected = connectionStatus === 'connected' || connectionStatus === 'ready';
 
     return (
-        <div className="flex flex-col h-screen bg-[#0d1117] text-gray-100 font-sans overflow-hidden">
-            {/* Header */}
-            <header className="px-6 py-4 bg-[#161b22] border-b border-[#30363d] flex items-center gap-3 shadow-lg z-10">
-                <div className="p-2 bg-gradient-to-br from-blue-500/20 to-purple-500/20 rounded-lg border border-blue-500/20">
-                    <Zap className="w-5 h-5 text-blue-400" />
+        <div className="flex flex-col h-screen overflow-hidden" style={{ backgroundColor: 'var(--vscode-sideBar-background)', color: 'var(--vscode-foreground)' }}>
+
+            {/* Header (Minimal) */}
+            <header className="px-4 py-2 border-b flex items-center justify-between shadow-sm z-10" style={{ borderColor: 'var(--vscode-panel-border)', backgroundColor: 'var(--vscode-sideBar-background)' }}>
+                <div className="flex items-center gap-2">
+                    <span className="font-semibold text-xs tracking-wide opacity-80" style={{ color: 'var(--vscode-sideBarTitle-foreground)' }}>LITE AGENT</span>
                 </div>
-                <div className="flex-1">
-                    <h1 className="font-bold text-lg tracking-tight bg-gradient-to-r from-blue-400 to-purple-400 bg-clip-text text-transparent">Lite Agent</h1>
-                    <div className="flex items-center gap-1.5">
-                        <div className={`w-1.5 h-1.5 rounded-full shadow-sm ${statusDot}`}></div>
-                        <span className="text-[10px] text-gray-400 uppercase tracking-wider font-medium">{statusText}</span>
-                    </div>
+                <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full" style={{ backgroundColor: 'var(--vscode-badge-background)', color: 'var(--vscode-badge-foreground)' }}>
+                    <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-white' : 'bg-red-500 animate-pulse'}`}></div>
+                    <span className="text-[9px] font-bold uppercase tracking-wider opacity-90">
+                        {isConnected ? 'Ready' : 'Offline'}
+                    </span>
                 </div>
             </header>
 
             {/* Messages Area */}
             <div className="flex-1 overflow-y-auto p-4 space-y-6 scroll-smooth custom-scrollbar">
                 {messages.length === 0 && (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-500 opacity-50 select-none">
-                        <Zap size={48} className="mb-4 text-gray-600" />
-                        <p className="text-sm">Start a conversation with Lite Agent</p>
-                        <p className="text-xs mt-2 text-gray-600">Type /help for available commands</p>
+                    <div className="h-full flex flex-col items-center justify-center select-none opacity-60">
+                        <div className="p-3 rounded-full mb-3" style={{ backgroundColor: 'var(--vscode-button-secondaryBackground)', color: 'var(--vscode-button-secondaryForeground)' }}>
+                            <Zap size={24} />
+                        </div>
+                        <p className="text-sm font-medium opacity-80">How can I help you code today?</p>
+                        <div className="mt-4 flex gap-2">
+                            <button
+                                className="px-3 py-1.5 rounded text-xs border hover:opacity-80 transition-opacity"
+                                style={{ borderColor: 'var(--vscode-button-border)', backgroundColor: 'var(--vscode-button-secondaryBackground)', color: 'var(--vscode-button-secondaryForeground)' }}
+                                onClick={() => setInput('/help ')}
+                            >
+                                /help
+                            </button>
+                            <button
+                                className="px-3 py-1.5 rounded text-xs border hover:opacity-80 transition-opacity"
+                                style={{ borderColor: 'var(--vscode-button-border)', backgroundColor: 'var(--vscode-button-secondaryBackground)', color: 'var(--vscode-button-secondaryForeground)' }}
+                                onClick={() => setInput('/tools ')}
+                            >
+                                /tools
+                            </button>
+                        </div>
                     </div>
                 )}
 
@@ -187,46 +306,45 @@ const App: React.FC = () => {
                     // System messages
                     if (msg.role === 'system') {
                         return (
-                            <div key={msg.id} className="flex justify-center">
-                                <div className="max-w-[90%] px-4 py-2.5 rounded-xl bg-[#1c2333] border border-[#30363d] text-xs text-gray-400 text-center">
-                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body system-msg" />
+                            <div key={msg.id} className="flex justify-center my-4">
+                                <div className="px-3 py-1.5 rounded border text-xs" style={{ backgroundColor: 'var(--vscode-textBlockQuote-background)', borderColor: 'var(--vscode-textBlockQuote-border)', color: 'var(--vscode-foreground)' }}>
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body system-msg inline-block" />
                                 </div>
                             </div>
                         );
                     }
 
+                    const isUser = msg.role === 'user';
+
                     return (
-                        <div
-                            key={msg.id}
-                            className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
-                        >
-                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 shadow-md ${msg.role === 'user'
-                                ? 'bg-blue-600 shadow-blue-900/20'
-                                : 'bg-gradient-to-br from-emerald-500 to-teal-600 shadow-emerald-900/20'
-                                }`}>
-                                {msg.role === 'user' ? <User size={16} className="text-white" /> : <Zap size={16} className="text-white" />}
+                        <div key={msg.id} className={`flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'} group`}>
+                            {/* Avatar */}
+                            <div className={`w-6 h-6 rounded flex items-center justify-center shrink-0 mt-0.5`}
+                                style={{ backgroundColor: isUser ? 'var(--vscode-button-background)' : 'var(--vscode-activityBar-foreground)', color: isUser ? 'var(--vscode-button-foreground)' : 'var(--vscode-activityBar-background)' }}>
+                                {isUser ? <User size={14} /> : <Zap size={14} />}
                             </div>
 
-                            <div
-                                className={`max-w-[85%] p-3.5 rounded-2xl shadow-md text-sm leading-7 ${msg.role === 'user'
-                                    ? 'bg-blue-600 text-white rounded-tr-md'
-                                    : 'bg-[#161b22] text-gray-300 border border-[#30363d] rounded-tl-md'
-                                    }`}
-                            >
+                            {/* Message Content */}
+                            <div className={`max-w-[85%] text-sm leading-relaxed ${isUser ? 'text-right' : 'text-left'}`}>
                                 {msg.attachments && msg.attachments.length > 0 && (
-                                    <div className="flex flex-wrap gap-1.5 mb-2">
+                                    <div className={`flex flex-wrap gap-1.5 mb-2 ${isUser ? 'justify-end' : 'justify-start'}`}>
                                         {msg.attachments.map((att, i) => (
-                                            <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/10 text-[11px] font-medium border border-white/10">
+                                            <span key={i} className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] border"
+                                                style={{ backgroundColor: 'var(--vscode-textCodeBlock-background)', borderColor: 'var(--vscode-widget-border)' }}>
                                                 {att.type === 'file' ? <File size={10} /> : <Folder size={10} />}
                                                 {att.name}
                                             </span>
                                         ))}
                                     </div>
                                 )}
-                                {msg.role === 'model' ? (
-                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body" />
+
+                                {isUser ? (
+                                    <div className="inline-block px-3 py-2 rounded-lg text-left"
+                                        style={{ backgroundColor: 'var(--vscode-button-secondaryBackground)', color: 'var(--vscode-button-secondaryForeground)' }}>
+                                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                                    </div>
                                 ) : (
-                                    <div className="whitespace-pre-wrap font-medium">{msg.content}</div>
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body" />
                                 )}
                             </div>
                         </div>
@@ -235,32 +353,89 @@ const App: React.FC = () => {
 
                 {isLoading && (
                     <div className="flex gap-3">
-                        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500/50 to-teal-600/50 flex items-center justify-center shrink-0">
-                            <Zap size={16} className="text-white/50" />
+                        <div className="w-6 h-6 rounded flex items-center justify-center shrink-0"
+                            style={{ backgroundColor: 'var(--vscode-activityBar-foreground)', color: 'var(--vscode-activityBar-background)' }}>
+                            <Zap size={14} />
                         </div>
-                        <div className="bg-[#161b22] border border-[#30363d] px-4 py-3 rounded-2xl rounded-tl-md flex items-center gap-2">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
-                            <span className="text-xs text-gray-400">Thinking...</span>
+                        <div className="px-3 py-2 rounded text-xs flex items-center gap-2"
+                            style={{ backgroundColor: 'var(--vscode-textBlockQuote-background)', color: 'var(--vscode-textBlockQuote-border)' }}>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Thinking...</span>
+                        </div>
+                        {/* Stop Button (only when loading) */}
+                        <button
+                            onClick={handleStop}
+                            className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 text-red-500 transition-colors"
+                            title="Stop Execution"
+                        >
+                            <Octagon size={14} fill="currentColor" className="opacity-80" />
+                        </button>
+                    </div>
+                )}
+
+                {/* Authorization Card */}
+                {authRequest && (
+                    <div className="my-4 mx-auto max-w-sm rounded border shadow-lg animate-in fade-in slide-in-from-bottom-2 duration-300"
+                        style={{ backgroundColor: 'var(--vscode-editor-background)', borderColor: 'var(--vscode-inputValidation-warningBorder)' }}>
+                        <div className="px-3 py-2 border-b flex items-center gap-2"
+                            style={{ backgroundColor: 'var(--vscode-inputValidation-warningBackground)', borderColor: 'var(--vscode-inputValidation-warningBorder)', color: 'var(--vscode-inputValidation-warningForeground)' }}>
+                            <ShieldAlert size={14} />
+                            <span className="font-bold text-xs uppercase tracking-wide">Permission Required</span>
+                        </div>
+                        <div className="p-3">
+                            <p className="text-sm mb-2">Lite Agent wants to execute:</p>
+                            <div className="p-2 mb-3 rounded border font-mono text-xs overflow-x-auto"
+                                style={{ backgroundColor: 'var(--vscode-textCodeBlock-background)', borderColor: 'var(--vscode-widget-border)' }}>
+                                <div className="font-bold text-blue-400 mb-1">{authRequest.toolName}</div>
+                                <div className="opacity-70 break-all">{JSON.stringify(authRequest.args, null, 2)}</div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                                <button
+                                    onClick={() => handleAuthorization('once')}
+                                    className="px-3 py-1.5 rounded text-xs border font-medium hover:opacity-80 transition-all flex items-center justify-center gap-1.5"
+                                    style={{ backgroundColor: 'var(--vscode-button-background)', color: 'var(--vscode-button-foreground)', borderColor: 'transparent' }}
+                                >
+                                    <Check size={12} />
+                                    Allow Once
+                                </button>
+                                <button
+                                    onClick={() => handleAuthorization('session')}
+                                    className="px-3 py-1.5 rounded text-xs border font-medium hover:opacity-80 transition-all flex items-center justify-center gap-1.5"
+                                    style={{ backgroundColor: 'var(--vscode-button-secondaryBackground)', color: 'var(--vscode-button-secondaryForeground)', borderColor: 'var(--vscode-button-border)' }}
+                                >
+                                    <ShieldCheck size={12} />
+                                    Allow Always
+                                </button>
+                                <button
+                                    onClick={() => handleAuthorization('deny')}
+                                    className="col-span-2 px-3 py-1.5 rounded text-xs border font-medium hover:bg-red-500/10 text-red-400 transition-all flex items-center justify-center gap-1.5"
+                                    style={{ borderColor: 'var(--vscode-button-border)' }}
+                                >
+                                    <Ban size={12} />
+                                    Deny Execution
+                                </button>
+                            </div>
                         </div>
                     </div>
                 )}
 
                 {/* Activity Steps */}
                 {activitySteps.length > 0 && (
-                    <div className="ml-11">
+                    <div className="ml-9 mt-2">
                         <button
                             onClick={() => setShowActivity(!showActivity)}
-                            className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-300 transition-colors mb-1.5"
+                            className="flex items-center gap-1 px-2 py-1 rounded text-[11px] opacity-70 hover:opacity-100 transition-opacity"
+                            style={{ backgroundColor: 'var(--vscode-editor-inactiveSelectionBackground)' }}
                         >
                             {showActivity ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                             <Activity size={12} />
                             <span>{activitySteps.length} step{activitySteps.length !== 1 ? 's' : ''}</span>
                         </button>
                         {showActivity && (
-                            <div className="border-l-2 border-[#30363d] pl-3 space-y-1">
+                            <div className="ml-1 pl-2 border-l mt-1 space-y-1" style={{ borderColor: 'var(--vscode-tree-indentGuidesStroke)' }}>
                                 {activitySteps.map((step, i) => (
-                                    <div key={i} className="text-[11px] text-gray-500 font-mono leading-5 flex items-start gap-2">
-                                        <span className="text-gray-600 select-none shrink-0">{i + 1}.</span>
+                                    <div key={i} className="text-[11px] font-mono leading-tight flex items-start gap-2 py-0.5 opacity-80">
+                                        <span className="select-none font-bold opacity-50">{i + 1}.</span>
                                         <span className="break-all">{step}</span>
                                     </div>
                                 ))}
@@ -272,95 +447,136 @@ const App: React.FC = () => {
             </div>
 
             {/* Input Area */}
-            <div className="p-4 bg-[#0d1117] border-t border-[#30363d]">
+            <div className="p-4 border-t relative" style={{ borderColor: 'var(--vscode-panel-border)', backgroundColor: 'var(--vscode-sideBar-background)' }}>
+                {/* Command Menu */}
+                {showCommandMenu && filteredCommands.length > 0 && (
+                    <div className="absolute bottom-full left-4 right-4 mb-2 border rounded shadow-xl overflow-hidden z-50"
+                        style={{ backgroundColor: 'var(--vscode-menu-background)', borderColor: 'var(--vscode-menu-border)', color: 'var(--vscode-menu-foreground)' }}>
+                        <div className="px-2 py-1.5 text-[10px] font-bold tracking-wider opacity-60 border-b flex items-center gap-2"
+                            style={{ borderColor: 'var(--vscode-menu-separatorBackground)' }}>
+                            AVAILABLE COMMANDS
+                        </div>
+                        <div className="max-h-[200px] overflow-y-auto p-1 custom-scrollbar">
+                            {filteredCommands.map((cmd, index) => {
+                                const Icon = cmd.icon;
+                                const isSelected = index === selectedIndex;
+                                return (
+                                    <button
+                                        key={cmd.name}
+                                        ref={isSelected ? selectedCommandRef : null}
+                                        onClick={() => {
+                                            setInput(cmd.name + ' ');
+                                            setShowCommandMenu(false);
+                                        }}
+                                        className={`w-full text-left px-2 py-1.5 rounded flex items-center gap-2 transition-colors ${isSelected ? 'selected' : ''}`}
+                                        style={{
+                                            backgroundColor: isSelected ? 'var(--vscode-list-activeSelectionBackground)' : 'transparent',
+                                            color: isSelected ? 'var(--vscode-list-activeSelectionForeground)' : 'var(--vscode-foreground)'
+                                        }}
+                                    >
+                                        <Icon size={14} className="opacity-80" />
+                                        <div className="flex flex-col">
+                                            <span className="font-bold text-xs">{cmd.name}</span>
+                                            <span className="text-[10px] opacity-70">{cmd.description}</span>
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+
                 {/* Attachment Chips */}
                 {attachments.length > 0 && (
-                    <div className="max-w-4xl mx-auto mb-2 flex flex-wrap gap-2">
+                    <div className="flex flex-wrap gap-2 mb-2">
                         {attachments.map((att) => (
                             <span
                                 key={att.path}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#161b22] border border-[#30363d] text-xs text-gray-300 font-medium group/chip hover:border-blue-500/50 transition-colors"
+                                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs border group/chip"
+                                style={{ backgroundColor: 'var(--vscode-inputOption-activeBackground)', borderColor: 'var(--vscode-inputOption-activeBorder)', color: 'var(--vscode-inputOption-activeForeground)' }}
                             >
-                                {att.type === 'file' ? <File size={12} className="text-blue-400" /> : <Folder size={12} className="text-amber-400" />}
-                                <span className="max-w-[150px] truncate">{att.name}</span>
+                                {att.type === 'file' ? <File size={10} /> : <Folder size={10} />}
+                                <span className="max-w-[120px] truncate">{att.name}</span>
                                 <button
                                     onClick={() => removeAttachment(att.path)}
-                                    className="ml-1 p-0.5 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400 transition-colors"
+                                    className="ml-1 p-0.5 rounded hover:bg-black/10 dark:hover:bg-white/10"
                                 >
-                                    <X size={12} />
+                                    <X size={10} />
                                 </button>
                             </span>
                         ))}
                     </div>
                 )}
 
-                <div className="max-w-4xl mx-auto relative group">
-                    <div className="absolute -inset-0.5 bg-gradient-to-r from-blue-500 to-purple-600 rounded-2xl blur opacity-20 group-hover:opacity-40 transition duration-500"></div>
-                    <div className="relative flex items-end bg-[#161b22] rounded-xl border border-[#30363d] shadow-2xl overflow-hidden focus-within:border-blue-500/50 transition-colors">
-                        {/* Attach Buttons */}
-                        <div className="flex flex-col gap-1 p-2">
-                            <button
-                                onClick={handleAttachFile}
-                                title="Attach file"
-                                className="p-2 rounded-lg text-gray-400 hover:text-blue-400 hover:bg-blue-500/10 transition-colors"
-                            >
-                                <Paperclip size={16} />
-                            </button>
-                            <button
-                                onClick={handleAttachFolder}
-                                title="Attach folder"
-                                className="p-2 rounded-lg text-gray-400 hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
-                            >
-                                <Folder size={16} />
-                            </button>
-                        </div>
+                <div className="relative">
+                    <div className="flex flex-col border rounded focus-within:ring-1 focus-within:ring-[var(--vscode-focusBorder)] transition-all"
+                        style={{ backgroundColor: 'var(--vscode-input-background)', borderColor: 'var(--vscode-input-border)' }}>
 
                         <textarea
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
-                            placeholder="Type a message or /help..."
-                            className="w-full bg-transparent text-gray-200 p-4 pl-0 min-h-[60px] max-h-[200px] outline-none resize-none placeholder-gray-500 font-medium"
+                            placeholder="Ask anything or type /"
+                            className="w-full bg-transparent p-3 min-h-[40px] max-h-[200px] outline-none resize-none text-sm font-sans"
+                            style={{ color: 'var(--vscode-input-foreground)' }}
                             rows={1}
-                            style={{ height: 'auto' }}
                         />
-                        <button
-                            onClick={handleSend}
-                            disabled={(!input.trim() && attachments.length === 0) || isLoading}
-                            className="m-2 p-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-200 hover:shadow-lg hover:shadow-blue-500/20 active:scale-95"
-                        >
-                            <Send size={18} />
-                        </button>
+
+                        <div className="flex justify-between items-center p-1.5 border-t" style={{ borderColor: 'var(--vscode-input-border)' }}>
+                            <div className="flex gap-0.5">
+                                <button
+                                    onClick={handleAttachFile}
+                                    title="Attach file"
+                                    className="p-1.5 rounded hover:opacity-80 transition-opacity"
+                                    style={{ color: 'var(--vscode-icon-foreground)' }}
+                                >
+                                    <Paperclip size={14} />
+                                </button>
+                                <button
+                                    onClick={handleAttachFolder}
+                                    title="Attach folder"
+                                    className="p-1.5 rounded hover:opacity-80 transition-opacity"
+                                    style={{ color: 'var(--vscode-icon-foreground)' }}
+                                >
+                                    <Folder size={14} />
+                                </button>
+                            </div>
+                            <button
+                                onClick={handleSend}
+                                disabled={(!input.trim() && attachments.length === 0) || isLoading}
+                                className="p-1.5 rounded disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                                style={{ backgroundColor: 'var(--vscode-button-background)', color: 'var(--vscode-button-foreground)' }}
+                            >
+                                <Send size={14} />
+                            </button>
+                        </div>
                     </div>
                 </div>
-                <div className="text-[10px] text-center text-gray-600 mt-3 font-medium tracking-wide">
-                    POWERED BY CLI
+                <div className="flex justify-center items-center gap-1.5 mt-2 opacity-40 select-none">
+                    <span className="text-[9px] font-sans tracking-tight">Lite Agent v0.0.1</span>
                 </div>
             </div>
         </div>
     );
 };
 
-// Markdown styles
+// Markdown styles (Native)
 const markdownStyles = `
-.markdown-body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-.markdown-body p { margin-bottom: 0.75em; }
-.markdown-body pre { background: #0d1117; padding: 1em; border-radius: 0.5rem; overflow-x: auto; border: 1px solid #30363d; margin: 1em 0; }
-.markdown-body code { background: rgba(110, 118, 129, 0.4); padding: 0.2em 0.4em; border-radius: 0.25rem; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-.markdown-body pre code { background: transparent; padding: 0; color: #e6edf3; font-size: 0.9em; }
-.markdown-body ul { list-style-type: disc; padding-left: 1.5em; margin-bottom: 0.75em; }
-.markdown-body ol { list-style-type: decimal; padding-left: 1.5em; margin-bottom: 0.75em; }
-.markdown-body h1 { font-size: 1.5em; font-weight: bold; margin-top: 1.5em; margin-bottom: 0.75em; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
-.markdown-body h2 { font-size: 1.3em; font-weight: bold; margin-top: 1.5em; margin-bottom: 0.75em; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
-.markdown-body h3 { font-size: 1.1em; font-weight: bold; margin-top: 1.5em; margin-bottom: 0.75em; }
-.markdown-body a { color: #58a6ff; text-decoration: none; }
-.markdown-body a:hover { text-decoration: underline; }
-.markdown-body blockquote { border-left: 4px solid #30363d; padding-left: 1em; color: #8b949e; margin: 1em 0; }
-.markdown-body table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-.markdown-body th, .markdown-body td { border: 1px solid #30363d; padding: 0.5em; }
-.markdown-body th { background: #161b22; }
-.system-msg .markdown-body p { margin-bottom: 0.25em; }
-.system-msg code { font-size: 0.9em; }
+.markdown-body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); font-size: 13px; line-height: 1.5; }
+.markdown-body p { margin-bottom: 0.5em; }
+.markdown-body pre { background-color: var(--vscode-textCodeBlock-background); padding: 8px; border-radius: 4px; overflow-x: auto; margin: 0.5em 0; border: 1px solid var(--vscode-widget-border); }
+.markdown-body code { font-family: var(--vscode-editor-font-family, monospace); background-color: var(--vscode-textCodeBlock-background); padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }
+.markdown-body pre code { background-color: transparent; padding: 0; color: var(--vscode-editor-foreground); }
+.markdown-body ul, .markdown-body ol { padding-left: 1.5em; margin-bottom: 0.5em; }
+.markdown-body a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; color: var(--vscode-textLink-activeForeground); }
+.markdown-body h1, .markdown-body h2, .markdown-body h3 { font-weight: 600; margin-top: 1em; margin-bottom: 0.5em; color: var(--vscode-foreground); }
+.markdown-body h1 { font-size: 1.2em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 0.2em; }
+.markdown-body h2 { font-size: 1.1em; }
+.markdown-body blockquote { border-left: 3px solid var(--vscode-textBlockQuote-border); background: var(--vscode-textBlockQuote-background); padding: 4px 8px; margin: 0.5em 0; opacity: 0.9; }
+.markdown-body table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+.markdown-body th, .markdown-body td { border: 1px solid var(--vscode-widget-border); padding: 6px; text-align: left; }
+.markdown-body th { background-color: var(--vscode-keybindingTable-headerBackground); }
 `;
 
 export default App;

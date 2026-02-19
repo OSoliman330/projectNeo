@@ -36,7 +36,7 @@ const extensionConfig = {
     output: {
         path: path.resolve(__dirname, 'dist'),
         filename: 'extension.js',
-        libraryTarget: 'commonjs',
+        libraryTarget: 'commonjs2',
     },
     resolve: {
         extensions: ['.ts', '.js'],
@@ -51,9 +51,8 @@ const extensionConfig = {
         ],
     },
     externals: {
+        // VS Code API - always external
         vscode: 'commonjs vscode',
-        '@google/genai': 'commonjs @google/genai',
-        'google-auth-library': 'commonjs google-auth-library',
     },
     devtool: 'source-map',
 };

@@ -43,6 +43,17 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                 case 'slashCommand':
                     this._handleSlashCommand(data.command, data.args);
                     break;
+                case 'webviewReady':
+                    if (this._geminiService?.isReady) {
+                        this._view?.webview.postMessage({ type: 'statusUpdate', value: 'connected' });
+                    }
+                    break;
+                case 'stop':
+                    this._geminiService?.stop();
+                    break;
+                case 'authorizationResponse':
+                    this._geminiService?.authorize(data.decision, data.toolName);
+                    break;
             }
         });
 
@@ -89,6 +100,16 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                 value: `\n⚠️ *${message}*\n`,
             });
             this._view?.webview.postMessage({ type: 'responseComplete' });
+        });
+
+        // Slash commands from service (e.g. typed in chat)
+        this._geminiService.on('slashCommand', (event: { command: string, args?: string }) => {
+            this._handleSlashCommand(event.command, event.args);
+        });
+
+        // Request authorization from the user for a tool
+        this._geminiService.on('requestAuthorization', (data: { toolName: string, prompt: string }) => {
+            this._view?.webview.postMessage({ type: 'requestAuthorization', value: data });
         });
 
         // Start SDK (async, fires 'status' and 'activity' events)
@@ -154,6 +175,8 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                         '`/clear` — Clear chat and reset context',
                         '`/restart` — Restart CLI process',
                         '`/status` — Show connection status',
+                        '`/mcp` — List connected MCP servers and their tools',
+                        '`/tools` — List all available tools',
                         '`/log` — Open debug log output',
                         '`/help` — Show this help message',
                     ].join('\n'),

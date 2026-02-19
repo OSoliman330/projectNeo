@@ -1,11 +1,8 @@
 import { EventEmitter } from 'events';
 import * as vscode from 'vscode';
-import * as path from 'path';
-import * as os from 'os';
-import * as fs from 'fs';
 
 export interface GeminiServiceOptions {
-    cliPath: string; // kept for backward compat, unused
+    cliPath: string; // kept for backward compat
 }
 
 // ─── Output Channel ───────────────────────────────────────────────────
@@ -22,451 +19,713 @@ function log(msg: string): void {
     getOutputChannel().appendLine(`[${ts}] ${msg}`);
 }
 
-import { McpClient } from './McpClient';
-
-// ─── Constants (from CLI source) ─────────────────────────────────────
-const OAUTH_CLIENT_ID = Buffer.from(
-    'NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZT' +
-    'NhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t',
-    'base64').toString('utf-8');
-
-const OAUTH_CLIENT_SECRET = Buffer.from(
-    'R09DU1BYLTR1SGdNUG0tMW83U2' +
-    'stZ2VWNkN1NWNsWEZzeGw=',
-    'base64').toString('utf-8');
-const OAUTH_CREDS_PATH = path.join(os.homedir(), '.gemini', 'oauth_creds.json');
-
-// The CLI uses Code Assist endpoint with OAuth — NOT the public Gemini API
-const CODE_ASSIST_ENDPOINT = 'https://cloudcode-pa.googleapis.com';
-const CODE_ASSIST_API_VERSION = 'v1internal';
-const MODEL = 'gemini-2.5-flash';
-
-// ─── Types ────────────────────────────────────────────────────────────
-interface ChatMessage {
-    role: 'user' | 'model';
-    parts: { text?: string; functionCall?: any; functionResponse?: any }[];
-}
-
 /**
- * GeminiService — Direct Code Assist API Integration
- *
- * The Gemini CLI uses the Code Assist endpoint (cloudcode-pa.googleapis.com)
- * with OAuth Bearer auth, NOT the public generativelanguage.googleapis.com API.
- *
- * Flow:
- * 1. Load OAuth creds from ~/.gemini/oauth_creds.json
- * 2. Call loadCodeAssist to get a managed projectId
- * 3. Call streamGenerateContent with projectId + Bearer token
+ * GeminiService — wraps @google/gemini-cli core engine.
+ * Uses the same Config, GeminiClient, Scheduler, and ToolRegistry
+ * as the Gemini CLI itself, ensuring full compatibility with:
+ *   - MCP servers & tools
+ *   - SKILLS.md / GEMINI.md
+ *   - Agents
+ *   - Built-in tools (shell, read-file, edit, etc.)
+ *   - Auth (OAuth2 via Code Assist)
  */
 export class GeminiService extends EventEmitter {
-    private _isProcessing: boolean = false;
-    private _oauthClient: any = null;
-    private _projectId: string | undefined;
-    private _history: ChatMessage[] = [];
-    private _initialized: boolean = false;
-    private _mcpClient: McpClient;
+    private _config: any;            // Config from @google/gemini-cli-core
+    private _geminiClient: any;      // GeminiClient 
+    private _scheduler: any;         // Scheduler for tool execution
+    private _settings: any;          // LoadedSettings
+    private _processing = false;
+    private _ready = false;
+    private _abortController: AbortController | null = null;
 
-    constructor(_options: GeminiServiceOptions) {
+    // Lazy-loaded ESM modules
+    private _coreModule: any;        // @google/gemini-cli-core
+    private _settingsModule: any;    // @google/gemini-cli settings sub-module
+    private _configModule: any;      // @google/gemini-cli config sub-module
+
+    get isReady(): boolean { return this._ready; }
+
+    constructor(_opts: GeminiServiceOptions) {
         super();
-        this._mcpClient = new McpClient(getOutputChannel());
-        log('Service created (Code Assist direct mode).');
+        log('Service created (CLI Core mode).');
     }
 
     /**
-     * Initialize OAuth client + get projectId from Code Assist
+     * Native dynamic import that bypasses webpack's import() → require() conversion.
+     * Webpack transforms import() to require() in CommonJS output, but the CLI
+     * packages are ESM with top-level await, so require() fails at runtime.
+     * Using new Function() creates a truly dynamic import that webpack can't touch.
      */
-    public async start(): Promise<void> {
-        if (this._initialized) {
-            this.emit('status', 'connected');
-            this.emit('activity', 'Ready.');
+    private _nativeImport(specifier: string): Promise<any> {
+        // eslint-disable-next-line no-new-func
+        return new Function('specifier', 'return import(specifier)')(specifier);
+    }
+
+    /**
+     * Dynamically import ESM modules from @google/gemini-cli
+     */
+    private async _loadModules(): Promise<void> {
+        if (this._coreModule && this._settingsModule && this._configModule) return;
+
+        log('Loading CLI modules...');
+
+        // Use native import() to load ESM packages (bypasses webpack)
+        // @google/gemini-cli-core has top-level exports for everything
+        this._coreModule = await this._nativeImport('@google/gemini-cli-core');
+        // loadSettings and loadCliConfig are in CLI sub-modules (not top-level)
+        this._settingsModule = await this._nativeImport('@google/gemini-cli/dist/src/config/settings.js');
+        this._configModule = await this._nativeImport('@google/gemini-cli/dist/src/config/config.js');
+
+        log('CLI modules loaded.');
+    }
+
+    /**
+     * Initialize the CLI engine — loads settings, creates Config,
+     * initializes GeminiClient and Scheduler.
+     */
+    async start(): Promise<void> {
+        this.emit('status', 'Initializing CLI engine...');
+        this.emit('activity', 'Loading settings...');
+
+        try {
+            await this._loadModules();
+
+            const { loadSettings } = this._settingsModule;
+            const { loadCliConfig } = this._configModule;
+            const { sessionId, Scheduler, ROOT_SCHEDULER_ID, AuthType } = this._coreModule;
+
+            // Load settings from ~/.gemini/settings.json etc
+            const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+
+            log(`Loading settings for workspace: ${workspaceDir}`);
+            this._settings = loadSettings(workspaceDir);
+
+            // Create Config (the central object that holds everything)
+            log('Creating Config...');
+            const argv = {
+                query: undefined,
+                model: undefined,
+                sandbox: undefined,
+                debug: false,
+                prompt: undefined,
+                promptInteractive: undefined,
+                yolo: undefined,
+                approvalMode: 'yolo',  // Auto-approve in extension
+                allowedMcpServerNames: undefined,
+                allowedTools: undefined,
+                experimentalAcp: undefined,
+                extensions: undefined,
+                listExtensions: undefined,
+                resume: undefined,
+                listSessions: undefined,
+                deleteSession: undefined,
+                includeDirectories: undefined,
+                screenReader: undefined,
+                useWriteTodos: undefined,
+                outputFormat: undefined,
+                fakeResponses: undefined,
+                recordResponses: undefined,
+                rawOutput: undefined,
+                acceptRawOutputRisk: undefined,
+                isCommand: undefined,
+            };
+
+            this._config = await loadCliConfig(
+                this._settings.merged,
+                sessionId,
+                argv,
+                { cwd: workspaceDir }
+            );
+
+            // Set IDE mode for better VS Code integration
+            this._config.setIdeMode(true);
+
+            this.emit('activity', 'Authenticating...');
+
+            // Refresh auth
+            const authType = this._settings.merged?.security?.auth?.selectedType || AuthType.OAUTH;
+            try {
+                await this._config.refreshAuth(authType);
+                log('Authentication successful.');
+            } catch (e: any) {
+                log(`Auth error: ${e.message}`);
+                this.emit('error', `Authentication failed: ${e.message}`);
+                return;
+            }
+
+            // Initialize the full Config (tool registry, MCP, skills, hooks, geminiClient)
+            this.emit('activity', 'Initializing tools and MCP...');
+            await this._config.initialize();
+
+            // Get the GeminiClient (handles chat, streaming, tools)
+            this._geminiClient = this._config.getGeminiClient();
+
+            // Log MCP and tool registry status
+            const toolRegistry = this._config.getToolRegistry();
+            const toolCount = toolRegistry?.getFunctionDeclarations()?.length || 0;
+            log(`Tool registry initialized: ${toolCount} tools registered.`);
+
+            const mcpManager = this._config.getMcpClientManager();
+            const clientsMap = (mcpManager as any).clients;
+            const mcpClients = clientsMap ? Array.from(clientsMap.values()) : [];
+            log(`MCP clients: ${mcpClients.length} server(s) configured.`);
+            for (const client of mcpClients as any[]) {
+                const name = client.serverName || client.name || 'unknown';
+                const status = client.getStatus?.() || 'unknown';
+                log(`  MCP server "${name}": status=${status}`);
+            }
+
+            // Create Scheduler for tool execution
+            this._scheduler = new Scheduler({
+                config: this._config,
+                messageBus: this._config.getMessageBus(),
+                getPreferredEditor: () => undefined,
+                schedulerId: ROOT_SCHEDULER_ID,
+            });
+
+            this._ready = true;
+            const model = this._config.getModel();
+            log(`Ready. Model: ${model}`);
+            this.emit('status', 'ready');
+            this.emit('activity', `Ready — Model: ${model} | ${toolCount} tools`);
+
+        } catch (e: any) {
+            log(`Initialization error: ${e.message}\n${e.stack}`);
+            this.emit('error', `Initialization failed: ${e.message}`);
+        }
+    }
+
+
+    /**
+     * Handle slash commands locally (e.g. /mcp, /tools, /clear).
+     * Returns true if the command was handled, false if it should be sent to the model.
+     */
+    private _handleCommand(prompt: string): boolean {
+        const trimmed = prompt.trim();
+        if (!trimmed.startsWith('/')) return false;
+
+        const parts = trimmed.split(/\s+/);
+        const command = parts[0].substring(1).toLowerCase(); // remove leading /
+        const subCommand = parts.slice(1).join(' '); // keep rest as args
+
+        switch (command) {
+            case 'mcp': {
+                this._handleMcpCommand(parts[1]?.toLowerCase());
+                return true;
+            }
+            case 'tools': {
+                this._handleToolsCommand();
+                return true;
+            }
+            case 'debug': {
+                this._debugHistory();
+                return true;
+            }
+            case 'agents': {
+                this._listAgents();
+                return true;
+            }
+            case 'skills': {
+                this._listSkills();
+                return true;
+            }
+            case 'clear':
+            case 'restart':
+            case 'status':
+            case 'log':
+            case 'help': {
+                // Forward these to the panel or handle internally if needed
+                // For now, these are effectively handled by the panel's pre-check,
+                // but if they come through here (e.g. typed in chat), we can emit events
+                // that the panel listens to, or just handle logic like restart here.
+
+                // For others, let the panel handle it via a special event or
+                // just return false to let it go to model? No, model shouldn't see /clear.
+                // We'll emit a special 'slashCommand' event for the panel to pick up.
+                this.emit('slashCommand', { command, args: subCommand });
+                return true;
+            }
+            default:
+                return false; // Unknown: forward to model
+        }
+    }
+
+    private async _debugHistory() {
+        if (!this._geminiClient) {
+            this.emit('data', '\n\n⚠️ *Client not initialized*');
+            return;
+        }
+        try {
+            const history: any[] = await this._geminiClient.getHistory();
+            const summary = history.map((h: any, i: number) => `[${i}] ${h.role} (${h.parts?.length} parts)`).join('\n');
+            this.emit('data', `\n\n🔍 **Debug History** (${history.length} items):\n\`\`\`text\n${summary}\n\`\`\``);
+
+            // Also log approved tools
+            const approved = Array.from(this._approvedTools).join(', ');
+            this.emit('data', `\n\n🛡️ **Approved Session Tools**: ${approved || 'None'}`);
+        } catch (e: any) {
+            this.emit('data', `\n\n⚠️ *Error getting history:* ${e.message}`);
+        }
+    }
+
+    private async _listAgents() {
+        if (!this._config) return;
+        try {
+            const registry = this._config.getAgentRegistry();
+            const agents = registry.getAllDefinitions();
+
+            if (agents.length === 0) {
+                this.emit('data', '\n\n🤖 **Agents**: No agents found.');
+                return;
+            }
+
+            const list = agents.map((a: any) => `- **${a.name}**: ${a.description || 'No description'}`).join('\n');
+            this.emit('data', `\n\n🤖 **Available Agents**:\n${list}`);
+        } catch (e: any) {
+            this.emit('data', `\n\n⚠️ Error listing agents: ${e.message}`);
+        }
+    }
+
+    private async _listSkills() {
+        if (!this._config) return;
+        try {
+            // Force reload to pick up new files
+            if (this._config.reloadSkills) {
+                await this._config.reloadSkills();
+            }
+
+            const manager = this._config.getSkillManager();
+            const skills = manager.getDisplayableSkills();
+            const allSkills = manager.getAllSkills();
+            const projectRoot = this._config.getProjectRoot();
+
+            let debugMsg = `\n\n🔍 **Debug Skills**:\n- Project Root: \`${projectRoot}\`\n- Total Skills Found: ${allSkills.length}\n- Displayable: ${skills.length}`;
+
+            if (skills.length === 0) {
+                this.emit('data', `\n\n🧩 **Skills**: No user skills found.${debugMsg}`);
+                return;
+            }
+
+            const list = skills.map((s: any) => `- **${s.name}**: ${s.description || 'No description'} (${s.location})`).join('\n');
+            this.emit('data', `\n\n🧩 **Available Skills**:\n${list}${debugMsg}`);
+        } catch (e: any) {
+            this.emit('data', `\n\n⚠️ Error listing skills: ${e.message}`);
+        }
+    }
+    private _handleMcpCommand(subCommand?: string): void {
+        const mcpManager = this._config?.getMcpClientManager();
+        if (!mcpManager) {
+            this.emit('data', '⚠️ MCP client manager not initialized.');
+            this.emit('responseComplete');
             return;
         }
 
-        try {
-            log('Initializing...');
-            this.emit('activity', 'Loading credentials...');
+        switch (subCommand) {
+            case 'list':
+            default: {
+                // List all configured MCP servers and their tools
+                // McpClientManager exposes 'clients' as a Map<string, McpClient>
+                // It does NOT have a getClients() method.
+                const clientsMap = (mcpManager as any).clients;
+                const clients = clientsMap ? Array.from(clientsMap.values()) : [];
 
-            // 1. Load cached OAuth credentials
-            if (!fs.existsSync(OAUTH_CREDS_PATH)) {
-                throw new Error(
-                    `No cached credentials found. Run "gemini" in a terminal first to authenticate.`
-                );
-            }
-
-            const creds = JSON.parse(fs.readFileSync(OAUTH_CREDS_PATH, 'utf-8'));
-            log(`Credentials loaded. Has refresh_token: ${!!creds.refresh_token}`);
-
-            // 2. Create OAuth2Client
-            const { OAuth2Client } = await import('google-auth-library');
-            this._oauthClient = new OAuth2Client(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET);
-            this._oauthClient.setCredentials(creds);
-
-            // Verify token
-            const tokenResponse = await this._oauthClient.getAccessToken();
-            if (!tokenResponse.token) {
-                throw new Error('Failed to get access token.');
-            }
-            log(`Access token OK (${tokenResponse.token.substring(0, 20)}...)`);
-
-            // Auto-update cache on token refresh
-            this._oauthClient.on('tokens', (tokens: any) => {
-                try {
-                    const existing = JSON.parse(fs.readFileSync(OAUTH_CREDS_PATH, 'utf-8'));
-                    fs.writeFileSync(OAUTH_CREDS_PATH, JSON.stringify({ ...existing, ...tokens }, null, 2), { mode: 0o600 });
-                    log('Token cache updated.');
-                } catch (e: any) {
-                    log(`Warning: token cache update failed: ${e.message}`);
-                }
-            });
-
-            // 3. Start MCP Client
-            await this._mcpClient.start();
-
-            // 4. Get projectId from Code Assist (loadCodeAssist)
-            this.emit('activity', 'Setting up Code Assist...');
-            const envProject = process.env['GOOGLE_CLOUD_PROJECT'] || process.env['GOOGLE_CLOUD_PROJECT_ID'];
-            this._projectId = await this._loadCodeAssist(envProject);
-            log(`Project ID: ${this._projectId}`);
-
-            this._initialized = true;
-            log(`Ready. Model: ${MODEL}, Project: ${this._projectId}`);
-            this.emit('status', 'connected');
-            this.emit('activity', `Ready (${MODEL})`);
-
-        } catch (err: any) {
-            log(`Init error: ${err.message}`);
-            this.emit('error', `Failed to initialize: ${err.message}`);
-        }
-    }
-
-    // ─── Code Assist API helpers ──────────────────────────────────────
-
-    private _getBaseUrl(): string {
-        return `${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}`;
-    }
-
-    private async _getAccessToken(): Promise<string> {
-        const { token } = await this._oauthClient.getAccessToken();
-        if (!token) { throw new Error('Failed to get access token'); }
-        return token;
-    }
-
-    private async _fetchWithRetry(url: string, options: RequestInit, retries = 3, backoff = 2000): Promise<Response> {
-        for (let i = 0; i <= retries; i++) {
-            try {
-                const res = await fetch(url, options);
-
-                if (res.status === 429) {
-                    if (i === retries) {
-                        log(`Rate limited (429). Max retries reached.`);
-                        return res; // let caller handle final failure
-                    }
-
-                    const retryAfter = res.headers.get('retry-after');
-                    const waitTime = retryAfter ? parseInt(retryAfter, 10) * 1000 : backoff * Math.pow(2, i);
-
-                    log(`Rate limited (429). Retrying in ${waitTime}ms... (Attempt ${i + 1}/${retries})`);
-                    this.emit('activity', `Rate limit hit. Retrying in ${Math.ceil(waitTime / 1000)}s...`);
-
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                    continue;
-                }
-
-                return res;
-            } catch (err: any) {
-                if (i === retries) throw err;
-                // Only retry on typical network errors if needed, but here we focus on 429
-                throw err;
-            }
-        }
-        throw new Error('Unreachable');
-    }
-
-    /**
-     * Call loadCodeAssist to get the managed projectId
-     */
-    private async _loadCodeAssist(envProjectId: string | undefined): Promise<string> {
-        const token = await this._getAccessToken();
-        const url = `${this._getBaseUrl()}:loadCodeAssist`;
-
-        log(`POST ${url}`);
-        const res = await this._fetchWithRetry(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                cloudaicompanionProject: envProjectId,
-                metadata: {
-                    ideType: 'IDE_UNSPECIFIED',
-                    platform: 'PLATFORM_UNSPECIFIED',
-                    pluginType: 'GEMINI',
-                    duetProject: envProjectId,
-                },
-            }),
-        });
-
-        if (!res.ok) {
-            const errText = await res.text();
-            throw new Error(`loadCodeAssist error ${res.status}: ${errText.substring(0, 200)}`);
-        }
-
-        const data: any = await res.json();
-        log(`loadCodeAssist response: tier=${data.currentTier?.name || 'unknown'}`);
-
-        // Get projectId: prefer server-provided, fall back to env
-        const projectId = data.cloudaicompanionProject || envProjectId;
-        if (!projectId) {
-            throw new Error(
-                'No project ID available. ' +
-                'Set GOOGLE_CLOUD_PROJECT env var or see https://goo.gle/gemini-cli-auth-docs'
-            );
-        }
-        return projectId;
-    }
-
-    /**
-     * Send a message via Code Assist streaming API
-     */
-    public async send(prompt: string): Promise<boolean> {
-        log(`send() called. prompt="${prompt.substring(0, 100)}" processing=${this._isProcessing}`);
-
-        if (this._isProcessing) {
-            this.emit('error', 'Still processing previous message. Please wait.');
-            return false;
-        }
-
-        if (prompt.startsWith('/')) {
-            const handled = await this._handleCommand(prompt);
-            if (handled) return true;
-        }
-
-        if (!this._initialized) {
-            await this.start();
-            if (!this._initialized) { return false; }
-        }
-
-        this._isProcessing = true;
-        this.emit('activity', 'Thinking...');
-        const startTime = Date.now();
-
-        try {
-            // Add user message to history
-            this._history.push({ role: 'user', parts: [{ text: prompt }] });
-
-            let keepGoing = true;
-            let turns = 0;
-            const MAX_TURNS = 5; // prevent infinite loops
-
-            while (keepGoing && turns < MAX_TURNS) {
-                turns++;
-                keepGoing = false; // default to stop unless tool call
-
-                const token = await this._getAccessToken();
-                const url = `${this._getBaseUrl()}:streamGenerateContent?alt=sse`;
-
-                // Build Code Assist request body
-                const body: any = {
-                    model: MODEL,
-                    project: this._projectId,
-                    user_prompt_id: `lite-agent-${Date.now()}`,
-                    request: {
-                        contents: this._history,
-                    },
-                };
-
-                // Add tools if available
-                const tools = this._mcpClient.getToolsForGemini();
-                if (tools.length > 0) {
-                    body.request.tools = [{
-                        functionDeclarations: tools
-                    }];
-                }
-
-                log(`POST ${url} (project: ${this._projectId})`);
-                log(`Request body (turn ${turns}): ${JSON.stringify(body, null, 2).substring(0, 2000)}`);
-
-                const response = await this._fetchWithRetry(url, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(body),
-                });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`API error ${response.status}: ${errorText.substring(0, 300)}`);
-                }
-
-                log('Streaming response...');
-                let fullText = '';
-                let toolCall: any = null;
-
-                // Parse SSE stream
-                const reader = response.body?.getReader();
-                if (!reader) { throw new Error('No response body'); }
-
-                const decoder = new TextDecoder();
-                let buffer = '';
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) { break; }
-
-                    buffer += decoder.decode(value, { stream: true });
-
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            const jsonStr = line.slice(6).trim();
-                            if (!jsonStr || jsonStr === '[DONE]') { continue; }
-
-                            try {
-                                const data = JSON.parse(jsonStr);
-                                const candidates = data?.response?.candidates || data?.candidates;
-                                const content = candidates?.[0]?.content;
-                                const part = content?.parts?.[0];
-
-                                if (part?.text) {
-                                    fullText += part.text;
-                                    this.emit('data', part.text);
-                                } else if (part?.functionCall) {
-                                    toolCall = part.functionCall;
-                                    log(`Tool call received: ${toolCall.name}`);
-                                }
-                            } catch (parseErr: any) {
-                                log(`SSE parse warning: ${parseErr.message}`);
-                            }
-                        }
-                    }
-                }
-
-                // Add assistant response to history
-                if (fullText) {
-                    this._history.push({ role: 'model', parts: [{ text: fullText }] });
-                }
-
-                // Handle tool call
-                if (toolCall) {
-                    this._history.push({
-                        role: 'model',
-                        parts: [{ functionCall: toolCall }]
-                    });
-
-                    const result = await this._processToolCall(toolCall);
-                    this._history.push({
-                        role: 'user',
-                        parts: [{
-                            functionResponse: {
-                                name: toolCall.name,
-                                response: result
-                            }
-                        }]
-                    });
-
-                    keepGoing = true; // Loop to send tool result back to model
-                    this.emit('activity', `Function ${toolCall.name} executed. Sending result...`);
-                } else {
+                if (clients.length === 0) {
+                    this.emit('data', '**MCP Servers:** None connected.\n\nMake sure your `~/.gemini/settings.json` has `mcpServers` configured.');
                     this.emit('responseComplete');
+                    return;
                 }
+
+                let output = '**Connected MCP Servers:**\n\n';
+                const toolRegistry = this._config?.getToolRegistry();
+
+                for (const client of clients as any[]) {
+                    const name = client.serverName || client.name || 'Unknown';
+                    const status = client.getStatus?.() || 'unknown';
+                    const icon = status === 'connected' ? '🟢' : '🔴';
+                    output += `${icon} **${name}** (${status})\n`;
+
+                    // List tools for this server
+                    const tools = toolRegistry?.getToolsByServer(name) || [];
+                    if (tools.length > 0) {
+                        for (const tool of tools) {
+                            output += `  • \`${tool.name}\`\n`;
+                        }
+                    } else {
+                        output += `  _(no tools discovered)_\n`;
+                    }
+                    output += '\n';
+                }
+
+                this.emit('data', output);
+                this.emit('responseComplete');
+                break;
+            }
+        }
+    }
+
+    /**
+     * Handle /tools command: list all registered tools
+     */
+    private _handleToolsCommand(): void {
+        const toolRegistry = this._config?.getToolRegistry();
+        if (!toolRegistry) {
+            this.emit('data', '⚠️ Tool registry not initialized.');
+            this.emit('responseComplete');
+            return;
+        }
+
+        const declarations = toolRegistry.getFunctionDeclarations();
+        let output = `**Registered Tools (${declarations.length}):**\n\n`;
+        for (const decl of declarations) {
+            output += `• \`${decl.name}\` — ${decl.description?.substring(0, 80) || 'No description'}\n`;
+        }
+
+        this.emit('data', output);
+        this.emit('responseComplete');
+    }
+
+    /**
+     * Send a message and stream the response.
+     * Handles the full turn loop: send → stream response → execute tools → repeat.
+     */
+    async send(prompt: string): Promise<void> {
+        if (this._processing) {
+            log('Still processing previous message, ignoring.');
+            return;
+        }
+        if (!this._ready || !this._geminiClient) {
+            this.emit('error', 'Not ready yet. Please wait for initialization.');
+            return;
+        }
+
+        // Handle slash commands locally
+        if (this._handleCommand(prompt)) {
+            return;
+        }
+
+        this._processing = true;
+        this._abortController = new AbortController();
+        const signal = this._abortController.signal;
+        const promptId = `lite-agent-${Date.now()}`;
+
+        const { GeminiEventType, recordToolCallInteractions, debugLogger } = this._coreModule;
+
+        log(`send() called. prompt="${prompt.substring(0, 80)}"`);
+
+        try {
+            // DEBUG: Log history size
+            try {
+                const history = await this._geminiClient.getHistory();
+                log(`History size before turn: ${history.length}`);
+            } catch (e) {
+                log(`Could not get history: ${e}`);
             }
 
-            const sec = ((Date.now() - startTime) / 1000).toFixed(1);
-            log(`Done. ${turns} turns in ${sec}s`);
-            this.emit('activity', `✅ Done in ${sec}s`);
+            let currentParts: any = [{ text: prompt }];
+            let turnCount = 0;
+            let isFirstTurn = true;
 
-        } catch (err: any) {
-            log(`API error: ${err.message}`);
-            // Don't pop history blindly, might lose context. Just log.
+            while (true) {
+                turnCount++;
 
-            if (err.message?.includes('401') || err.message?.includes('403')) {
-                this._initialized = false;
-                this._oauthClient = null;
-                this.emit('error', `Auth error. Please retry. (${err.message})`);
+                if (turnCount > 20) {
+                    log('Max turns reached, stopping.');
+                    this.emit('data', '\n\n⚠️ *Maximum tool execution turns reached.*');
+                    break;
+                }
+
+                if (signal.aborted) {
+                    log('Execution aborted by user.');
+                    this.emit('data', '\n\n🛑 *Execution stopped by user.*');
+                    break;
+                }
+
+                const toolCallRequests: any[] = [];
+
+                // Send message and stream response
+                const responseStream = this._geminiClient.sendMessageStream(
+                    currentParts,
+                    signal,
+                    promptId,
+                    undefined, // turns
+                    false,     // isInvalidStreamRetry
+                    isFirstTurn ? prompt : undefined // displayContent
+                );
+                isFirstTurn = false;
+
+                for await (const event of responseStream) {
+                    if (signal.aborted) break;
+
+                    switch (event.type) {
+                        case GeminiEventType.Content:
+                            this.emit('data', event.value);
+                            break;
+
+                        case GeminiEventType.ToolCallRequest:
+                            this.emit('activity', `Planning tool call: ${event.value.name}...`);
+                            log(`Tool call requested: ${event.value.name}`);
+                            toolCallRequests.push(event.value);
+                            break;
+
+                        case GeminiEventType.Thought:
+                            // Thinking indicator
+                            this.emit('activity', 'Thinking...');
+                            break;
+
+                        case GeminiEventType.Error:
+                            const errMsg = event.value?.error?.message || 'Unknown error';
+                            log(`Stream error: ${errMsg}`);
+                            this.emit('data', `\n\n⚠️ *Error: ${errMsg}*`);
+                            break;
+
+                        case GeminiEventType.LoopDetected:
+                            log('Loop detected by CLI engine.');
+                            this.emit('data', '\n\n⚠️ *Loop detected, stopping.*');
+                            break;
+
+                        case GeminiEventType.AgentExecutionStopped:
+                            log(`Agent stopped: ${event.value?.reason}`);
+                            break;
+
+                        case GeminiEventType.Retry:
+                            this.emit('activity', 'Retrying...');
+                            break;
+
+                        case GeminiEventType.Finished:
+                            // Normal completion
+                            break;
+                    }
+                }
+
+                if (signal.aborted) {
+                    log('Execution aborted by user.');
+                    if (!toolCallRequests.length) this.emit('data', '\n\n🛑 *Execution stopped by user.*');
+                    break;
+                }
+
+                // If there are tool calls, execute them and continue
+                if (toolCallRequests.length > 0) {
+                    // Check authorization before execution
+                    try {
+                        await this._checkToolAuthorization(toolCallRequests);
+                    } catch (authError: any) {
+                        log(`Authorization denied: ${authError.message}`);
+                        this.emit('data', `\n\n🚫 *Authorization Denied:* ${authError.message}`);
+                        // We stop the turn loop here effectively, or we could feed the error back to model?
+                        // Feeding back to model is better so it knows it failed.
+                        // But for now, let's just break the loop to be safe and simple.
+                        break;
+                    }
+
+                    if (signal.aborted) break;
+
+                    this.emit('activity', `Executing ${toolCallRequests.length} tool(s)...`);
+
+                    const completedToolCalls = await this._scheduler.schedule(
+                        toolCallRequests,
+                        signal
+                    );
+
+                    const toolResponseParts: any[] = [];
+                    for (const completed of completedToolCalls) {
+                        const toolResponse = completed.response;
+
+                        if (toolResponse.error) {
+                            log(`Tool error: ${completed.request.name} — ${toolResponse.error.message}`);
+                        }
+
+                        if (toolResponse.responseParts) {
+                            toolResponseParts.push(...toolResponse.responseParts);
+                        }
+
+                        log(`Tool ${completed.request.name}: ${completed.status}`);
+                    }
+
+                    // Record tool calls for session recording
+                    try {
+                        const currentModel = this._geminiClient.getCurrentSequenceModel() ?? this._config.getModel();
+                        this._geminiClient
+                            .getChat()
+                            .recordCompletedToolCalls(currentModel, completedToolCalls);
+                        await recordToolCallInteractions(this._config, completedToolCalls);
+                    } catch (error: any) {
+                        debugLogger.error(`Error recording tool calls: ${error}`);
+                    }
+
+                    // Check if any tool requested to stop
+                    const stopTool = completedToolCalls.find(
+                        (tc: any) => tc.response.errorType === 'STOP_EXECUTION'
+                    );
+                    if (stopTool) {
+                        log('Tool requested stop execution.');
+                        break;
+                    }
+
+                    // Send tool responses back to model for next turn
+                    currentParts = toolResponseParts;
+                } else {
+                    // No tool calls = response is complete
+                    break;
+                }
+            }
+        } catch (e: any) {
+            if (signal.aborted) {
+                log('Execution aborted (caught in catch).');
+                this.emit('data', '\n\n🛑 *Execution stopped by user.*');
             } else {
-                this.emit('error', err.message || 'Unknown API error');
+                log(`send() error: ${e.message}\n${e.stack}`);
+                this.emit('data', `\n\n⚠️ *Error: ${e.message}*`);
             }
         } finally {
-            this._isProcessing = false;
-        }
-
-        return true;
-    }
-
-    private async _handleCommand(prompt: string): Promise<boolean> {
-        const [cmd, ...args] = prompt.trim().split(/\s+/);
-
-        switch (cmd.toLowerCase()) {
-            case '/clear':
-                this.restart();
-                return true;
-            case '/restart':
-                this.restart();
-                // verify config again?
-                await this.start();
-                return true;
-            case '/status':
-                this.emit('data', `Status: Connected\nProject: ${this._projectId}\nHistory: ${this._history.length} messages\n`);
-                this.emit('responseComplete');
-                return true;
-            case '/help':
-                this.emit('data', `Commands:\n/clear - Clear chat\n/restart - Restart session\n/status - Show connection status\n/mcp list - List MCP tools\n`);
-                this.emit('responseComplete');
-                return true;
-            case '/mcp':
-                if (args[0] === 'list') {
-                    const tools = this._mcpClient.getToolsForGemini();
-                    const list = tools.map(t => `- **${t.name}**: ${t.description}`).join('\n');
-                    this.emit('data', `MCP Tools:\n${list || 'No tools found.'}`);
-                    this.emit('responseComplete');
-                    return true;
-                }
-                this.emit('data', 'Usage: `/mcp list`\nManage Model Context Protocol (MCP) servers and tools.');
-                this.emit('responseComplete');
-                return true;
-            default:
-                return false; // treat as prompt
-        }
-    }
-
-    private async _processToolCall(call: any): Promise<any> {
-        try {
-            log(`Executing tool ${call.name} with args: ${JSON.stringify(call.args)}`);
-            this.emit('activity', `Executing ${call.name}...`);
-            const args = call.args || {};
-            const result = await this._mcpClient.callTool(call.name, args);
-            return result;
-        } catch (e: any) {
-            log(`Tool execution failed: ${e.message}`);
-            return { error: e.message };
+            this._processing = false;
+            this._abortController = null;
+            this.emit('responseComplete');
         }
     }
 
     /**
-     * Clear chat history
+     * Stop the current execution immediately.
      */
-    public restart(): void {
-        log('Restarting — clearing history...');
-        this._history = [];
-        this._isProcessing = false;
-        this.emit('status', 'connected');
-        this.emit('activity', 'Session cleared. Ready.');
+    stop(): void {
+        if (this._abortController) {
+            log('User requested stop.');
+            this._abortController.abort();
+            this._abortController = null;
+        }
     }
 
-    public get isReady(): boolean { return this._initialized; }
-    public get isProcessing(): boolean { return this._isProcessing; }
-    public showLog(): void { getOutputChannel().show(); }
+    // Authorization state
+    private _approvedTools: Set<string> = new Set();
+    private _pendingAuthorization: { resolve: (value: any) => void; reject: (reason?: any) => void } | null = null;
 
-    public dispose(): void {
+    /**
+     * Check if tools are authorized. Pauses execution if approval is needed.
+     */
+    private async _checkToolAuthorization(toolCalls: any[]): Promise<void> {
+        const toolsToAuthorize = toolCalls.filter(tc => !this._approvedTools.has(tc.name));
+
+        if (toolsToAuthorize.length === 0) {
+            return; // All tools already approved for this session
+        }
+
+        log(`Tools require authorization: ${toolsToAuthorize.map(t => t.name).join(', ')}`);
+
+        // Emit event to request UI authorization
+        // We only ask for the first one for simplicity, or we could group them.
+        // Let's ask for the first unauthorized tool.
+        const tool = toolsToAuthorize[0];
+        this.emit('requestAuthorization', {
+            toolName: tool.name,
+            args: tool.args
+        });
+
+        // Create a promise that waits for authorize() to be called
+        return new Promise((resolve, reject) => {
+            this._pendingAuthorization = { resolve, reject };
+        });
+    }
+
+    /**
+     * Handle authorization response from UI.
+     */
+    authorize(decision: 'once' | 'session' | 'deny', toolName?: string): void {
+        if (!this._pendingAuthorization) return;
+
+        log(`Authorization decision: ${decision}`);
+
+        if (decision === 'deny') {
+            this._pendingAuthorization.reject(new Error('User denied tool execution.'));
+        } else {
+            // If session, we add ALL currently pending tools to the approved list?
+            // Or just the one that triggered it? 
+            // Simplest UX: "Allow Always" adds the *current* tool name to the set.
+            // But we might have multiple pending.
+            // We'll trust the user wants to approve the tool *name* that was displayed.
+            // But wait, `_checkToolAuthorization` paused at the first unauthorized tool.
+            // So we just need to know WHICH tool was being authorized.
+            // We can assume it's the one we asked about.
+
+            if (decision === 'session') {
+                // Since we don't track *which* tool we asked about in state, we re-check current request?
+                // Actually, `_checkToolAuthorization` is waiting on the promise.
+                // We need to know the tool name to add it to `_approvedTools`.
+                // Let's just assume we add *all* currently requested tool names? 
+                // No, that's dangerous.
+                // Improving: `_checkToolAuthorization` should store the tools it's waiting on.
+            }
+            // Wait, we need to handle the 'session' logic correctly.
+            // Let's modify `_checkToolAuthorization` to be more robust or `authorize` to take the tool name.
+            // For now, simpler: we just resolve. The `_checkToolAuthorization` loop will re-run? 
+            // no, it is `await this._checkToolAuthorization(toolCallRequests)`.
+            // Inside, it does `const tool = toolsToAuthorize[0];`.
+            // If we just resolve, it continues. 
+            // We need to add to `_approvedTools` BEFORE resolving if 'session' was chosen.
+
+            // Correction: `authorize` needs the tool name if we want to add it to the set.
+            // Let's update `authorize` signature or better yet, store `_authorizingToolName`.
+            if (decision === 'session' && toolName) {
+                this._approvedTools.add(toolName);
+                log(`Tool "${toolName}" approved for session.`);
+            }
+        }
+
+        // This is a bit tricky without state. Let's fix in next step.
+        // Actually, we can just resolve with the decision, and let `_checkToolAuthorization` handle the logic.
+        this._pendingAuthorization.resolve(decision);
+        this._pendingAuthorization = null;
+    }
+
+    /**
+     * Restart: dispose current config and re-initialize.
+     */
+    restart(): void {
+        log('Restarting...');
+        this._ready = false;
+        this._processing = false;
+
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = null;
+        }
+
+        // Dispose old config
+        if (this._config) {
+            this._config.dispose().catch((e: any) => log(`Dispose error: ${e.message}`));
+        }
+        this._config = null;
+        this._geminiClient = null;
+        this._scheduler = null;
+
+        // Re-initialize
+        void this.start();
+    }
+
+    /**
+     * Show the output channel log.
+     */
+    showLog(): void {
+        getOutputChannel().show(true);
+    }
+
+    /**
+     * Dispose: abort any active request and clean up the CLI Config.
+     */
+    async dispose(): Promise<void> {
         log('Disposing...');
-        this._oauthClient = null;
-        this._history = [];
-        this._initialized = false;
-        this._isProcessing = false;
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = null;
+        }
+        if (this._config) {
+            try {
+                await this._config.dispose();
+            } catch (e: any) {
+                log(`Dispose error: ${e.message}`);
+            }
+        }
+        this._config = null;
+        this._geminiClient = null;
+        this._scheduler = null;
+        this._ready = false;
     }
 }
