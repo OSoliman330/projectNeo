@@ -137,6 +137,9 @@ export class GeminiService extends EventEmitter {
                 { cwd: workspaceDir }
             );
 
+            // Force disable interactive shell to prevent PTY usage (which causes hangs in extension)
+            (this._config as any).enableInteractiveShell = false;
+
             // Set IDE mode for better VS Code integration
             this._config.setIdeMode(true);
 
