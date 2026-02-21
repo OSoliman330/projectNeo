@@ -68,7 +68,21 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
      *────────────────────────────────────────────────*/
 
     private _initGeminiService() {
-        this._geminiService = new GeminiService({ cliPath: '' });
+        const outputChannel = vscode.window.createOutputChannel('Lite Agent');
+        const env = {
+            log(msg: string) {
+                const ts = new Date().toISOString().slice(11, 23);
+                outputChannel.appendLine(`[${ts}] ${msg}`);
+            },
+            showLog() {
+                outputChannel.show(true);
+            },
+            getWorkspacePath() {
+                return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+            }
+        };
+
+        this._geminiService = new GeminiService({ cliPath: '', env });
 
         // Stream data chunks to the webview in real-time
         this._geminiService.on('data', (chunk: string) => {
@@ -281,7 +295,7 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
     }
 }
 
-function getNonce() {
+export function getNonce() {
     let text = '';
     const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     for (let i = 0; i < 32; i++) {
@@ -289,3 +303,4 @@ function getNonce() {
     }
     return text;
 }
+

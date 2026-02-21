@@ -1,22 +1,14 @@
 import { EventEmitter } from 'events';
-import * as vscode from 'vscode';
+
+export interface HostEnvironment {
+    log(msg: string): void;
+    showLog(): void;
+    getWorkspacePath(): string;
+}
 
 export interface GeminiServiceOptions {
     cliPath: string; // kept for backward compat
-}
-
-// ─── Output Channel ───────────────────────────────────────────────────
-let _outputChannel: vscode.OutputChannel | null = null;
-function getOutputChannel(): vscode.OutputChannel {
-    if (!_outputChannel) {
-        _outputChannel = vscode.window.createOutputChannel('Lite Agent');
-    }
-    return _outputChannel;
-}
-
-function log(msg: string): void {
-    const ts = new Date().toISOString().slice(11, 23);
-    getOutputChannel().appendLine(`[${ts}] ${msg}`);
+    env: HostEnvironment;
 }
 
 /**
@@ -45,9 +37,9 @@ export class GeminiService extends EventEmitter {
 
     get isReady(): boolean { return this._ready; }
 
-    constructor(_opts: GeminiServiceOptions) {
+    constructor(private readonly _opts: GeminiServiceOptions) {
         super();
-        log('Service created (CLI Core mode).');
+        this._opts.env.log('Service created (CLI Core mode).');
     }
 
     /**
@@ -67,7 +59,7 @@ export class GeminiService extends EventEmitter {
     private async _loadModules(): Promise<void> {
         if (this._coreModule && this._settingsModule && this._configModule) return;
 
-        log('Loading CLI modules...');
+        this._opts.env.log('Loading CLI modules...');
 
         // Use native import() to load ESM packages (bypasses webpack)
         // @google/gemini-cli-core has top-level exports for everything
@@ -76,7 +68,7 @@ export class GeminiService extends EventEmitter {
         this._settingsModule = await this._nativeImport('@google/gemini-cli/dist/src/config/settings.js');
         this._configModule = await this._nativeImport('@google/gemini-cli/dist/src/config/config.js');
 
-        log('CLI modules loaded.');
+        this._opts.env.log('CLI modules loaded.');
     }
 
     /**
@@ -95,13 +87,13 @@ export class GeminiService extends EventEmitter {
             const { sessionId, Scheduler, ROOT_SCHEDULER_ID, AuthType } = this._coreModule;
 
             // Load settings from ~/.gemini/settings.json etc
-            const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+            const workspaceDir = this._opts.env.getWorkspacePath();
 
-            log(`Loading settings for workspace: ${workspaceDir}`);
+            this._opts.env.log(`Loading settings for workspace: ${workspaceDir}`);
             this._settings = loadSettings(workspaceDir);
 
             // Create Config (the central object that holds everything)
-            log('Creating Config...');
+            this._opts.env.log('Creating Config...');
             const argv = {
                 query: undefined,
                 model: undefined,
@@ -149,9 +141,9 @@ export class GeminiService extends EventEmitter {
             const authType = this._settings.merged?.security?.auth?.selectedType || AuthType.OAUTH;
             try {
                 await this._config.refreshAuth(authType);
-                log('Authentication successful.');
+                this._opts.env.log('Authentication successful.');
             } catch (e: any) {
-                log(`Auth error: ${e.message}`);
+                this._opts.env.log(`Auth error: ${e.message}`);
                 this.emit('error', `Authentication failed: ${e.message}`);
                 return;
             }
@@ -166,16 +158,16 @@ export class GeminiService extends EventEmitter {
             // Log MCP and tool registry status
             const toolRegistry = this._config.getToolRegistry();
             const toolCount = toolRegistry?.getFunctionDeclarations()?.length || 0;
-            log(`Tool registry initialized: ${toolCount} tools registered.`);
+            this._opts.env.log(`Tool registry initialized: ${toolCount} tools registered.`);
 
             const mcpManager = this._config.getMcpClientManager();
             const clientsMap = (mcpManager as any).clients;
             const mcpClients = clientsMap ? Array.from(clientsMap.values()) : [];
-            log(`MCP clients: ${mcpClients.length} server(s) configured.`);
+            this._opts.env.log(`MCP clients: ${mcpClients.length} server(s) configured.`);
             for (const client of mcpClients as any[]) {
                 const name = client.serverName || client.name || 'unknown';
                 const status = client.getStatus?.() || 'unknown';
-                log(`  MCP server "${name}": status=${status}`);
+                this._opts.env.log(`  MCP server "${name}": status=${status}`);
             }
 
             // Create Scheduler for tool execution
@@ -188,12 +180,12 @@ export class GeminiService extends EventEmitter {
 
             this._ready = true;
             const model = this._config.getModel();
-            log(`Ready. Model: ${model}`);
+            this._opts.env.log(`Ready. Model: ${model}`);
             this.emit('status', 'ready');
             this.emit('activity', `Ready — Model: ${model} | ${toolCount} tools`);
 
         } catch (e: any) {
-            log(`Initialization error: ${e.message}\n${e.stack}`);
+            this._opts.env.log(`Initialization error: ${e.message}\n${e.stack}`);
             this.emit('error', `Initialization failed: ${e.message}`);
         }
     }
@@ -389,7 +381,7 @@ export class GeminiService extends EventEmitter {
      */
     async send(prompt: string): Promise<void> {
         if (this._processing) {
-            log('Still processing previous message, ignoring.');
+            this._opts.env.log('Still processing previous message, ignoring.');
             return;
         }
         if (!this._ready || !this._geminiClient) {
@@ -409,15 +401,15 @@ export class GeminiService extends EventEmitter {
 
         const { GeminiEventType, recordToolCallInteractions, debugLogger } = this._coreModule;
 
-        log(`send() called. prompt="${prompt.substring(0, 80)}"`);
+        this._opts.env.log(`send() called. prompt="${prompt.substring(0, 80)}"`);
 
         try {
             // DEBUG: Log history size
             try {
                 const history = await this._geminiClient.getHistory();
-                log(`History size before turn: ${history.length}`);
+                this._opts.env.log(`History size before turn: ${history.length}`);
             } catch (e) {
-                log(`Could not get history: ${e}`);
+                this._opts.env.log(`Could not get history: ${e}`);
             }
 
             let currentParts: any = [{ text: prompt }];
@@ -428,13 +420,13 @@ export class GeminiService extends EventEmitter {
                 turnCount++;
 
                 if (turnCount > 20) {
-                    log('Max turns reached, stopping.');
+                    this._opts.env.log('Max turns reached, stopping.');
                     this.emit('data', '\n\n⚠️ *Maximum tool execution turns reached.*');
                     break;
                 }
 
                 if (signal.aborted) {
-                    log('Execution aborted by user.');
+                    this._opts.env.log('Execution aborted by user.');
                     this.emit('data', '\n\n🛑 *Execution stopped by user.*');
                     break;
                 }
@@ -462,7 +454,7 @@ export class GeminiService extends EventEmitter {
 
                         case GeminiEventType.ToolCallRequest:
                             this.emit('activity', `Planning tool call: ${event.value.name}...`);
-                            log(`Tool call requested: ${event.value.name}`);
+                            this._opts.env.log(`Tool call requested: ${event.value.name}`);
                             toolCallRequests.push(event.value);
                             break;
 
@@ -473,17 +465,17 @@ export class GeminiService extends EventEmitter {
 
                         case GeminiEventType.Error:
                             const errMsg = event.value?.error?.message || 'Unknown error';
-                            log(`Stream error: ${errMsg}`);
+                            this._opts.env.log(`Stream error: ${errMsg}`);
                             this.emit('data', `\n\n⚠️ *Error: ${errMsg}*`);
                             break;
 
                         case GeminiEventType.LoopDetected:
-                            log('Loop detected by CLI engine.');
+                            this._opts.env.log('Loop detected by CLI engine.');
                             this.emit('data', '\n\n⚠️ *Loop detected, stopping.*');
                             break;
 
                         case GeminiEventType.AgentExecutionStopped:
-                            log(`Agent stopped: ${event.value?.reason}`);
+                            this._opts.env.log(`Agent stopped: ${event.value?.reason}`);
                             break;
 
                         case GeminiEventType.Retry:
@@ -497,7 +489,7 @@ export class GeminiService extends EventEmitter {
                 }
 
                 if (signal.aborted) {
-                    log('Execution aborted by user.');
+                    this._opts.env.log('Execution aborted by user.');
                     if (!toolCallRequests.length) this.emit('data', '\n\n🛑 *Execution stopped by user.*');
                     break;
                 }
@@ -508,7 +500,7 @@ export class GeminiService extends EventEmitter {
                     try {
                         await this._checkToolAuthorization(toolCallRequests);
                     } catch (authError: any) {
-                        log(`Authorization denied: ${authError.message}`);
+                        this._opts.env.log(`Authorization denied: ${authError.message}`);
                         this.emit('data', `\n\n🚫 *Authorization Denied:* ${authError.message}`);
                         // We stop the turn loop here effectively, or we could feed the error back to model?
                         // Feeding back to model is better so it knows it failed.
@@ -530,14 +522,14 @@ export class GeminiService extends EventEmitter {
                         const toolResponse = completed.response;
 
                         if (toolResponse.error) {
-                            log(`Tool error: ${completed.request.name} — ${toolResponse.error.message}`);
+                            this._opts.env.log(`Tool error: ${completed.request.name} — ${toolResponse.error.message}`);
                         }
 
                         if (toolResponse.responseParts) {
                             toolResponseParts.push(...toolResponse.responseParts);
                         }
 
-                        log(`Tool ${completed.request.name}: ${completed.status}`);
+                        this._opts.env.log(`Tool ${completed.request.name}: ${completed.status}`);
                     }
 
                     // Record tool calls for session recording
@@ -556,7 +548,7 @@ export class GeminiService extends EventEmitter {
                         (tc: any) => tc.response.errorType === 'STOP_EXECUTION'
                     );
                     if (stopTool) {
-                        log('Tool requested stop execution.');
+                        this._opts.env.log('Tool requested stop execution.');
                         break;
                     }
 
@@ -569,10 +561,10 @@ export class GeminiService extends EventEmitter {
             }
         } catch (e: any) {
             if (signal.aborted) {
-                log('Execution aborted (caught in catch).');
+                this._opts.env.log('Execution aborted (caught in catch).');
                 this.emit('data', '\n\n🛑 *Execution stopped by user.*');
             } else {
-                log(`send() error: ${e.message}\n${e.stack}`);
+                this._opts.env.log(`send() error: ${e.message}\n${e.stack}`);
                 this.emit('data', `\n\n⚠️ *Error: ${e.message}*`);
             }
         } finally {
@@ -587,7 +579,7 @@ export class GeminiService extends EventEmitter {
      */
     stop(): void {
         if (this._abortController) {
-            log('User requested stop.');
+            this._opts.env.log('User requested stop.');
             this._abortController.abort();
             this._abortController = null;
         }
@@ -601,27 +593,22 @@ export class GeminiService extends EventEmitter {
      * Check if tools are authorized. Pauses execution if approval is needed.
      */
     private async _checkToolAuthorization(toolCalls: any[]): Promise<void> {
-        const toolsToAuthorize = toolCalls.filter(tc => !this._approvedTools.has(tc.name));
+        for (const tool of toolCalls) {
+            if (this._approvedTools.has(tool.name)) continue;
 
-        if (toolsToAuthorize.length === 0) {
-            return; // All tools already approved for this session
+            this._opts.env.log(`Tool requires authorization: ${tool.name}`);
+
+            const promise = new Promise((resolve, reject) => {
+                this._pendingAuthorization = { resolve, reject };
+            });
+
+            this.emit('requestAuthorization', {
+                toolName: tool.name,
+                args: tool.args
+            });
+
+            await promise;
         }
-
-        log(`Tools require authorization: ${toolsToAuthorize.map(t => t.name).join(', ')}`);
-
-        // Emit event to request UI authorization
-        // We only ask for the first one for simplicity, or we could group them.
-        // Let's ask for the first unauthorized tool.
-        const tool = toolsToAuthorize[0];
-        this.emit('requestAuthorization', {
-            toolName: tool.name,
-            args: tool.args
-        });
-
-        // Create a promise that waits for authorize() to be called
-        return new Promise((resolve, reject) => {
-            this._pendingAuthorization = { resolve, reject };
-        });
     }
 
     /**
@@ -630,7 +617,7 @@ export class GeminiService extends EventEmitter {
     authorize(decision: 'once' | 'session' | 'deny', toolName?: string): void {
         if (!this._pendingAuthorization) return;
 
-        log(`Authorization decision: ${decision}`);
+        this._opts.env.log(`Authorization decision: ${decision}`);
 
         if (decision === 'deny') {
             this._pendingAuthorization.reject(new Error('User denied tool execution.'));
@@ -664,7 +651,7 @@ export class GeminiService extends EventEmitter {
             // Let's update `authorize` signature or better yet, store `_authorizingToolName`.
             if (decision === 'session' && toolName) {
                 this._approvedTools.add(toolName);
-                log(`Tool "${toolName}" approved for session.`);
+                this._opts.env.log(`Tool "${toolName}" approved for session.`);
             }
         }
 
@@ -678,7 +665,7 @@ export class GeminiService extends EventEmitter {
      * Restart: dispose current config and re-initialize.
      */
     restart(): void {
-        log('Restarting...');
+        this._opts.env.log('Restarting...');
         this._ready = false;
         this._processing = false;
 
@@ -689,7 +676,7 @@ export class GeminiService extends EventEmitter {
 
         // Dispose old config
         if (this._config) {
-            this._config.dispose().catch((e: any) => log(`Dispose error: ${e.message}`));
+            this._config.dispose().catch((e: any) => this._opts.env.log(`Dispose error: ${e.message}`));
         }
         this._config = null;
         this._geminiClient = null;
@@ -703,14 +690,14 @@ export class GeminiService extends EventEmitter {
      * Show the output channel log.
      */
     showLog(): void {
-        getOutputChannel().show(true);
+        this._opts.env.showLog();
     }
 
     /**
      * Dispose: abort any active request and clean up the CLI Config.
      */
     async dispose(): Promise<void> {
-        log('Disposing...');
+        this._opts.env.log('Disposing...');
         if (this._abortController) {
             this._abortController.abort();
             this._abortController = null;
@@ -719,7 +706,7 @@ export class GeminiService extends EventEmitter {
             try {
                 await this._config.dispose();
             } catch (e: any) {
-                log(`Dispose error: ${e.message}`);
+                this._opts.env.log(`Dispose error: ${e.message}`);
             }
         }
         this._config = null;
