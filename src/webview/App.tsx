@@ -41,7 +41,7 @@ const App: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
     const [connectionStatus, setConnectionStatus] = useState<string>('connecting');
-    const [activitySteps, setActivitySteps] = useState<string[]>([]);
+    const [activitySteps, setActivitySteps] = useState<{ type: 'activity' | 'thought', value: string }[]>([]);
     const [showActivity, setShowActivity] = useState(true);
     const [authRequest, setAuthRequest] = useState<AuthorizationRequest | null>(null);
 
@@ -98,7 +98,18 @@ const App: React.FC = () => {
                     break;
 
                 case 'activityStep':
-                    setActivitySteps(prev => [...prev, message.value]);
+                    setActivitySteps(prev => [...prev, { type: 'activity', value: message.value }]);
+                    break;
+
+                case 'thought':
+                    setActivitySteps(prev => {
+                        // If the last step is a thought, append to it instead of making a new block
+                        const last = prev[prev.length - 1];
+                        if (last && last.type === 'thought') {
+                            return [...prev.slice(0, -1), { type: 'thought', value: last.value + message.value }];
+                        }
+                        return [...prev, { type: 'thought', value: message.value }];
+                    });
                     break;
 
                 case 'fileSelected':
@@ -109,7 +120,7 @@ const App: React.FC = () => {
                     break;
 
                 case 'requestAuthorization':
-                    setActivitySteps(prev => [...prev, `Waiting for approval: ${message.value.toolName}`]);
+                    setActivitySteps(prev => [...prev, { type: 'activity', value: `Waiting for approval: ${message.value.toolName}` }]);
                     setAuthRequest(message.value);
                     setIsLoading(true); // Ensure loading state is active while waiting
                     break;
@@ -192,7 +203,7 @@ const App: React.FC = () => {
         vscode.postMessage({ type: 'stop' });
         setIsLoading(false);
         setAuthRequest(null);
-        setActivitySteps(prev => [...prev, '🛑 Execution stopped by user.']);
+        setActivitySteps(prev => [...prev, { type: 'activity', value: '🛑 Execution stopped by user.' }]);
     };
 
     const handleAuthorization = (decision: 'once' | 'session' | 'deny') => {
@@ -206,9 +217,9 @@ const App: React.FC = () => {
 
         setAuthRequest(null);
         if (decision === 'deny') {
-            setActivitySteps(prev => [...prev, `🚫 Denied: ${authRequest.toolName}`]);
+            setActivitySteps(prev => [...prev, { type: 'activity', value: `🚫 Denied: ${authRequest.toolName}` }]);
         } else {
-            setActivitySteps(prev => [...prev, `✅ Approved: ${authRequest.toolName} (${decision === 'session' ? 'always' : 'once'})`]);
+            setActivitySteps(prev => [...prev, { type: 'activity', value: `✅ Approved: ${authRequest.toolName} (${decision === 'session' ? 'always' : 'once'})` }]);
         }
     };
 
@@ -308,7 +319,7 @@ const App: React.FC = () => {
                         return (
                             <div key={msg.id} className="flex justify-center my-4">
                                 <div className="px-3 py-1.5 rounded border text-xs" style={{ backgroundColor: 'var(--vscode-textBlockQuote-background)', borderColor: 'var(--vscode-textBlockQuote-border)', color: 'var(--vscode-foreground)' }}>
-                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body system-msg inline-block" />
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) as string }} className="markdown-body system-msg inline-block" />
                                 </div>
                             </div>
                         );
@@ -344,7 +355,7 @@ const App: React.FC = () => {
                                         <div className="whitespace-pre-wrap">{msg.content}</div>
                                     </div>
                                 ) : (
-                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} className="markdown-body" />
+                                    <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) as string }} className="markdown-body" />
                                 )}
                             </div>
                         </div>
@@ -433,12 +444,27 @@ const App: React.FC = () => {
                         </button>
                         {showActivity && (
                             <div className="ml-1 pl-2 border-l mt-1 space-y-1" style={{ borderColor: 'var(--vscode-tree-indentGuidesStroke)' }}>
-                                {activitySteps.map((step, i) => (
-                                    <div key={i} className="text-[11px] font-mono leading-tight flex items-start gap-2 py-0.5 opacity-80">
-                                        <span className="select-none font-bold opacity-50">{i + 1}.</span>
-                                        <span className="break-all">{step}</span>
-                                    </div>
-                                ))}
+                                {activitySteps.map((step, i) => {
+                                    if (step.type === 'thought') {
+                                        return (
+                                            <details key={i} className="text-[11px] font-mono leading-tight py-0.5 opacity-80 group">
+                                                <summary className="cursor-pointer select-none flex items-center gap-1 list-none outline-none text-blue-400">
+                                                    <span className="text-[10px] opacity-70 group-open:rotate-90 transition-transform">▶</span>
+                                                    <span className="italic">Thinking...</span>
+                                                </summary>
+                                                <div className="pl-3 mt-1.5 mb-2 border-l border-blue-500/20 italic opacity-80 whitespace-pre-wrap break-words">
+                                                    {step.value}
+                                                </div>
+                                            </details>
+                                        );
+                                    }
+                                    return (
+                                        <div key={i} className="text-[11px] font-mono leading-tight flex items-start gap-2 py-0.5 opacity-80">
+                                            <span className="select-none font-bold opacity-50">{i + 1}.</span>
+                                            <span className="break-all">{step.value}</span>
+                                        </div>
+                                    );
+                                })}
                             </div>
                         )}
                     </div>

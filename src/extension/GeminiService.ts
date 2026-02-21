@@ -150,7 +150,10 @@ export class GeminiService extends EventEmitter {
 
             // Initialize the full Config (tool registry, MCP, skills, hooks, geminiClient)
             this.emit('activity', 'Initializing tools and MCP...');
+            const startTime = Date.now();
             await this._config.initialize();
+            const initDuration = Date.now() - startTime;
+            this._opts.env.log(`Config/MCP initialization took ${initDuration}ms`);
 
             // Get the GeminiClient (handles chat, streaming, tools)
             this._geminiClient = this._config.getGeminiClient();
@@ -399,177 +402,256 @@ export class GeminiService extends EventEmitter {
         const signal = this._abortController.signal;
         const promptId = `lite-agent-${Date.now()}`;
 
-        const { GeminiEventType, recordToolCallInteractions, debugLogger } = this._coreModule;
+        const { GeminiEventType, recordToolCallInteractions, debugLogger, promptIdContext } = this._coreModule;
 
         this._opts.env.log(`send() called. prompt="${prompt.substring(0, 80)}"`);
 
+        // Telemetry Logging Setup (Safe temp directory)
+        const telemetryLog: string[] = [];
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        telemetryLog.push(`# AI Execution Trace: ${timestamp}`);
+        telemetryLog.push(`\n## User Prompt\n\`\`\`text\n${prompt}\n\`\`\`\n`);
+
         try {
-            // DEBUG: Log history size
-            try {
-                const history = await this._geminiClient.getHistory();
-                this._opts.env.log(`History size before turn: ${history.length}`);
-            } catch (e) {
-                this._opts.env.log(`Could not get history: ${e}`);
-            }
-
-            let currentParts: any = [{ text: prompt }];
-            let turnCount = 0;
-            let isFirstTurn = true;
-
-            while (true) {
-                turnCount++;
-
-                if (turnCount > 20) {
-                    this._opts.env.log('Max turns reached, stopping.');
-                    this.emit('data', '\n\n⚠️ *Maximum tool execution turns reached.*');
-                    break;
+            await promptIdContext.run(promptId, async () => {
+                // DEBUG: Log history size
+                try {
+                    const history = await this._geminiClient.getHistory();
+                    this._opts.env.log(`History size before turn: ${history.length}`);
+                } catch (e) {
+                    this._opts.env.log(`Could not get history: ${e}`);
                 }
 
-                if (signal.aborted) {
-                    this._opts.env.log('Execution aborted by user.');
-                    this.emit('data', '\n\n🛑 *Execution stopped by user.*');
-                    break;
-                }
+                let currentParts: any = [{ text: prompt }];
+                let turnCount = 0;
+                let isFirstTurn = true;
 
-                const toolCallRequests: any[] = [];
+                while (true) {
+                    turnCount++;
 
-                // Send message and stream response
-                const responseStream = this._geminiClient.sendMessageStream(
-                    currentParts,
-                    signal,
-                    promptId,
-                    undefined, // turns
-                    false,     // isInvalidStreamRetry
-                    isFirstTurn ? prompt : undefined // displayContent
-                );
-                isFirstTurn = false;
-
-                for await (const event of responseStream) {
-                    if (signal.aborted) break;
-
-                    switch (event.type) {
-                        case GeminiEventType.Content:
-                            this.emit('data', event.value);
-                            break;
-
-                        case GeminiEventType.ToolCallRequest:
-                            this.emit('activity', `Planning tool call: ${event.value.name}...`);
-                            this._opts.env.log(`Tool call requested: ${event.value.name}`);
-                            toolCallRequests.push(event.value);
-                            break;
-
-                        case GeminiEventType.Thought:
-                            // Thinking indicator
-                            this.emit('activity', 'Thinking...');
-                            break;
-
-                        case GeminiEventType.Error:
-                            const errMsg = event.value?.error?.message || 'Unknown error';
-                            this._opts.env.log(`Stream error: ${errMsg}`);
-                            this.emit('data', `\n\n⚠️ *Error: ${errMsg}*`);
-                            break;
-
-                        case GeminiEventType.LoopDetected:
-                            this._opts.env.log('Loop detected by CLI engine.');
-                            this.emit('data', '\n\n⚠️ *Loop detected, stopping.*');
-                            break;
-
-                        case GeminiEventType.AgentExecutionStopped:
-                            this._opts.env.log(`Agent stopped: ${event.value?.reason}`);
-                            break;
-
-                        case GeminiEventType.Retry:
-                            this.emit('activity', 'Retrying...');
-                            break;
-
-                        case GeminiEventType.Finished:
-                            // Normal completion
-                            break;
-                    }
-                }
-
-                if (signal.aborted) {
-                    this._opts.env.log('Execution aborted by user.');
-                    if (!toolCallRequests.length) this.emit('data', '\n\n🛑 *Execution stopped by user.*');
-                    break;
-                }
-
-                // If there are tool calls, execute them and continue
-                if (toolCallRequests.length > 0) {
-                    // Check authorization before execution
-                    try {
-                        await this._checkToolAuthorization(toolCallRequests);
-                    } catch (authError: any) {
-                        this._opts.env.log(`Authorization denied: ${authError.message}`);
-                        this.emit('data', `\n\n🚫 *Authorization Denied:* ${authError.message}`);
-                        // We stop the turn loop here effectively, or we could feed the error back to model?
-                        // Feeding back to model is better so it knows it failed.
-                        // But for now, let's just break the loop to be safe and simple.
+                    if (turnCount > 20) {
+                        this._opts.env.log('Max turns reached, stopping.');
+                        this.emit('data', '\n\n⚠️ *Maximum tool execution turns reached.*');
+                        telemetryLog.push(`\n## Error\nMaximum tool execution turns reached.`);
                         break;
                     }
 
-                    if (signal.aborted) break;
-
-                    this.emit('activity', `Executing ${toolCallRequests.length} tool(s)...`);
-
-                    const completedToolCalls = await this._scheduler.schedule(
-                        toolCallRequests,
-                        signal
-                    );
-
-                    const toolResponseParts: any[] = [];
-                    for (const completed of completedToolCalls) {
-                        const toolResponse = completed.response;
-
-                        if (toolResponse.error) {
-                            this._opts.env.log(`Tool error: ${completed.request.name} — ${toolResponse.error.message}`);
-                        }
-
-                        if (toolResponse.responseParts) {
-                            toolResponseParts.push(...toolResponse.responseParts);
-                        }
-
-                        this._opts.env.log(`Tool ${completed.request.name}: ${completed.status}`);
-                    }
-
-                    // Record tool calls for session recording
-                    try {
-                        const currentModel = this._geminiClient.getCurrentSequenceModel() ?? this._config.getModel();
-                        this._geminiClient
-                            .getChat()
-                            .recordCompletedToolCalls(currentModel, completedToolCalls);
-                        await recordToolCallInteractions(this._config, completedToolCalls);
-                    } catch (error: any) {
-                        debugLogger.error(`Error recording tool calls: ${error}`);
-                    }
-
-                    // Check if any tool requested to stop
-                    const stopTool = completedToolCalls.find(
-                        (tc: any) => tc.response.errorType === 'STOP_EXECUTION'
-                    );
-                    if (stopTool) {
-                        this._opts.env.log('Tool requested stop execution.');
+                    if (signal.aborted) {
+                        this._opts.env.log('Execution aborted by user.');
+                        this.emit('data', '\n\n🛑 *Execution stopped by user.*');
+                        telemetryLog.push(`\n## Aborted\nExecution stopped by user.`);
                         break;
                     }
 
-                    // Send tool responses back to model for next turn
-                    currentParts = toolResponseParts;
-                } else {
-                    // No tool calls = response is complete
-                    break;
+                    const toolCallRequests: any[] = [];
+                    let currentThought = '';
+                    let currentContent = '';
+
+                    // Send message and stream response
+                    const responseStream = this._geminiClient.sendMessageStream(
+                        currentParts,
+                        signal,
+                        promptId,
+                        undefined, // turns
+                        false,     // isInvalidStreamRetry
+                        isFirstTurn ? prompt : undefined // displayContent
+                    );
+                    isFirstTurn = false;
+
+                    telemetryLog.push(`\n### Turn ${turnCount}`);
+
+                    for await (const event of responseStream) {
+                        if (signal.aborted) break;
+
+                        switch (event.type) {
+                            case GeminiEventType.Content:
+                                this.emit('data', event.value);
+                                currentContent += event.value;
+                                break;
+
+                            case GeminiEventType.ToolCallRequest:
+                                this.emit('activity', `Planning tool call: ${event.value.name}...`);
+                                this._opts.env.log(`Tool call requested: ${event.value.name}`);
+                                toolCallRequests.push(event.value);
+                                break;
+
+                            case GeminiEventType.Thought:
+                                // Thinking indicator - handle both string and object formats
+                                let thoughtText = '';
+                                if (typeof event.value === 'string') {
+                                    thoughtText = event.value;
+                                } else if (event.value && typeof event.value === 'object') {
+                                    if (event.value.subject && event.value.description) {
+                                        thoughtText = `**${event.value.subject}**\n${event.value.description}`;
+                                    } else {
+                                        thoughtText = event.value.description || event.value.subject || JSON.stringify(event.value);
+                                    }
+                                }
+
+                                if (!thoughtText) {
+                                    thoughtText = 'Thinking...';
+                                }
+
+                                this.emit('thought', thoughtText);
+                                currentThought += thoughtText + '\n\n';
+                                break;
+
+                            case GeminiEventType.Error:
+                                const errMsg = event.value?.error?.message || 'Unknown error';
+                                this._opts.env.log(`Stream error: ${errMsg}`);
+                                this.emit('data', `\n\n⚠️ *Error: ${errMsg}*`);
+                                telemetryLog.push(`\n**Stream Error**: ${errMsg}`);
+                                break;
+
+                            case GeminiEventType.LoopDetected:
+                                this._opts.env.log('Loop detected by CLI engine.');
+                                this.emit('data', '\n\n⚠️ *Loop detected, stopping.*');
+                                telemetryLog.push(`\n**Loop Detected**`);
+                                break;
+
+                            case GeminiEventType.AgentExecutionStopped:
+                                this._opts.env.log(`Agent stopped: ${event.value?.reason}`);
+                                telemetryLog.push(`\n**Agent Stopped**: ${event.value?.reason}`);
+                                break;
+
+                            case GeminiEventType.Retry:
+                                this.emit('activity', 'Retrying...');
+                                telemetryLog.push(`\n*Retrying...*`);
+                                break;
+
+                            case GeminiEventType.Finished:
+                                // Normal completion
+                                break;
+                        }
+                    }
+
+                    // Log recorded information for this turn
+                    if (currentThought) {
+                        telemetryLog.push(`\n#### AI Thought\n${currentThought}`);
+                    }
+                    if (currentContent) {
+                        telemetryLog.push(`\n#### AI Response\n${currentContent}`);
+                    }
+
+                    if (signal.aborted) {
+                        this._opts.env.log('Execution aborted by user.');
+                        if (!toolCallRequests.length) this.emit('data', '\n\n🛑 *Execution stopped by user.*');
+                        telemetryLog.push(`\n## Aborted\nExecution stopped by user.`);
+                        break;
+                    }
+
+                    // If there are tool calls, execute them and continue
+                    if (toolCallRequests.length > 0) {
+                        telemetryLog.push(`\n#### Tool Requests`);
+                        for (const req of toolCallRequests) {
+                            telemetryLog.push(`- **${req.name}**\n  \`\`\`json\n  ${JSON.stringify(req.args, null, 2).replace(/\n/g, '\n  ')}\n  \`\`\``);
+                        }
+
+                        // Check authorization before execution
+                        try {
+                            await this._checkToolAuthorization(toolCallRequests);
+                        } catch (authError: any) {
+                            this._opts.env.log(`Authorization denied: ${authError.message}`);
+                            this.emit('data', `\n\n🚫 *Authorization Denied:* ${authError.message}`);
+                            telemetryLog.push(`\n**Authorization Denied**: ${authError.message}`);
+                            break;
+                        }
+
+                        if (signal.aborted) break;
+
+                        this.emit('activity', `Executing ${toolCallRequests.length} tool(s)...`);
+
+                        const completedToolCalls = await this._scheduler.schedule(
+                            toolCallRequests,
+                            signal
+                        );
+
+                        const toolResponseParts: any[] = [];
+                        telemetryLog.push(`\n#### Tool Responses`);
+
+                        for (const completed of completedToolCalls) {
+                            const toolResponse = completed.response;
+
+                            if (toolResponse.error) {
+                                this._opts.env.log(`Tool error: ${completed.request.name} — ${toolResponse.error.message}`);
+                                telemetryLog.push(`- **${completed.request.name}** Error: ${toolResponse.error.message}`);
+                            } else {
+                                // Extract just the parts for the log to avoid huge JSONs if possible, or stringify response
+                                try {
+                                    const responseSnippet = JSON.stringify(toolResponse.responseParts).substring(0, 1000);
+                                    telemetryLog.push(`- **${completed.request.name}** Success. Response snippet:\n  \`\`\`json\n  ${responseSnippet}...\n  \`\`\``);
+                                } catch (e) {
+                                    telemetryLog.push(`- **${completed.request.name}** Success.`);
+                                }
+                            }
+
+                            if (toolResponse.responseParts) {
+                                toolResponseParts.push(...toolResponse.responseParts);
+                            }
+
+                            this._opts.env.log(`Tool ${completed.request.name}: ${completed.status}`);
+                        }
+
+                        // Record tool calls for session recording
+                        try {
+                            const currentModel = this._geminiClient.getCurrentSequenceModel() ?? this._config.getModel();
+                            this._geminiClient
+                                .getChat()
+                                .recordCompletedToolCalls(currentModel, completedToolCalls);
+                            await recordToolCallInteractions(this._config, completedToolCalls);
+                        } catch (error: any) {
+                            debugLogger.error(`Error recording tool calls: ${error}`);
+                        }
+
+                        // Check if any tool requested to stop
+                        const stopTool = completedToolCalls.find(
+                            (tc: any) => tc.response.errorType === 'STOP_EXECUTION'
+                        );
+                        if (stopTool) {
+                            this._opts.env.log('Tool requested stop execution.');
+                            telemetryLog.push(`\n**Tool Requested Stop Execution**`);
+                            break;
+                        }
+
+                        // Send tool responses back to model for next turn
+                        currentParts = toolResponseParts;
+                    } else {
+                        // No tool calls = response is complete
+                        break;
+                    }
                 }
-            }
+            });
         } catch (e: any) {
             if (signal.aborted) {
                 this._opts.env.log('Execution aborted (caught in catch).');
                 this.emit('data', '\n\n🛑 *Execution stopped by user.*');
+                telemetryLog.push(`\n## Aborted\nExecution stopped by user (caught error).`);
             } else {
                 this._opts.env.log(`send() error: ${e.message}\n${e.stack}`);
                 this.emit('data', `\n\n⚠️ *Error: ${e.message}*`);
+                telemetryLog.push(`\n## Error\n${e.message}\n\`\`\`\n${e.stack}\n\`\`\``);
             }
         } finally {
             this._processing = false;
             this._abortController = null;
+
+            // Save telemetry log safely to OS temp directory
+            try {
+                const fs = require('fs');
+                const os = require('os');
+                const path = require('path');
+
+                const logsDir = path.join(os.tmpdir(), 'gemini-lite-agent-logs');
+                if (!fs.existsSync(logsDir)) {
+                    fs.mkdirSync(logsDir, { recursive: true });
+                }
+                const logFilePath = path.join(logsDir, `run-${timestamp}.md`);
+                fs.writeFileSync(logFilePath, telemetryLog.join('\n'), 'utf8');
+                this._opts.env.log(`Telemetry safely saved to ${logFilePath}`);
+            } catch (err: any) {
+                this._opts.env.log(`Failed to write telemetry file: ${err.message}`);
+            }
+
             this.emit('responseComplete');
         }
     }

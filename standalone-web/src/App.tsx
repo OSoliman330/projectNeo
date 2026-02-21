@@ -70,6 +70,9 @@ function App() {
                 case 'activityStep':
                     addLog({ type: 'activity', text: `> ${message.value}` });
                     break;
+                case 'thought':
+                    addLog({ type: 'thought', text: message.value });
+                    break;
                 case 'systemMessage':
                     addLog({ type: 'system', text: message.value });
                     break;
@@ -90,7 +93,7 @@ function App() {
         logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [logs]);
 
-    const addLog = (log: { type: 'system' | 'output' | 'activity', text: string }) => {
+    const addLog = (log: { type: 'system' | 'output' | 'activity' | 'thought', text: string }) => {
         setLogs(prev => [...prev, { id: Date.now() + Math.random(), ...log }]);
     };
 
@@ -248,6 +251,17 @@ function App() {
                                             <div className="text-purple-400/80 tracking-wide flex items-center gap-2 ml-3 border-l-2 border-purple-500/30 pl-2 py-0.5 my-0.5">
                                                 {log.text}
                                             </div>
+                                        )}
+                                        {log.type === 'thought' && (
+                                            <details className="text-gray-400 ml-3 text-xs mb-1.5 group">
+                                                <summary className="cursor-pointer text-purple-400/80 hover:text-purple-300 select-none flex items-center gap-1 list-none outline-none">
+                                                    <span className="text-[10px] opacity-70 group-open:rotate-90 transition-transform">▶</span>
+                                                    <span className="italic">Thinking...</span>
+                                                </summary>
+                                                <div className="pl-3 mt-1.5 mb-2 border-l border-purple-500/20 italic opacity-80 whitespace-pre-wrap">
+                                                    {log.text}
+                                                </div>
+                                            </details>
                                         )}
                                         {log.type === 'output' && (
                                             <div className="text-gray-300 ml-3 font-normal mt-0.5 mb-1.5">

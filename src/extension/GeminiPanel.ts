@@ -102,6 +102,14 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
             });
         });
 
+        // Thoughts (Thinking Process)
+        this._geminiService.on('thought', (text: string) => {
+            this._view?.webview.postMessage({
+                type: 'thought',
+                value: text,
+            });
+        });
+
         // Status updates
         this._geminiService.on('status', (status: string) => {
             this._view?.webview.postMessage({ type: 'statusUpdate', value: status });

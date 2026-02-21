@@ -54,6 +54,10 @@ wss.on('connection', (ws: WebSocket) => {
         sendToClient('activityStep', text);
     });
 
+    geminiService.on('thought', (text: string) => {
+        sendToClient('thought', text);
+    });
+
     geminiService.on('status', (status: string) => {
         sendToClient('statusUpdate', status);
     });
