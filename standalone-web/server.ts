@@ -93,12 +93,8 @@ wss.on('connection', (ws: WebSocket) => {
             switch (data.type) {
                 case 'sendMessage':
                     const { prompt, attachments } = data.value;
-                    let fullPrompt = prompt;
-                    if (attachments && attachments.length > 0) {
-                        const attachmentList = attachments.map((a: any) => a.path).join(', ');
-                        fullPrompt = `[Attached: ${attachmentList}] ${prompt}`;
-                    }
-                    await geminiService.send(fullPrompt);
+                    const attachmentPaths = (attachments || []).map((a: any) => typeof a === 'string' ? a : a.path);
+                    await geminiService.send(prompt, attachmentPaths);
                     break;
                 case 'stop':
                     geminiService.stop();
@@ -146,6 +142,30 @@ wss.on('connection', (ws: WebSocket) => {
                         }
                     } catch (err: any) {
                         env.log(`Dialog initialization error: ${err.message || err}`);
+                    }
+                    break;
+                case 'showFileOpenDialog':
+                    try {
+                        const { exec } = require('child_process');
+                        if (process.platform === 'win32') {
+                            // PowerShell to open OpenFileDialog with multi-select
+                            const psCommand = `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Multiselect = $true; $f.Title = 'Select Files for Workflow'; if($f.ShowDialog() -eq 'OK'){$f.FileNames -join '|'}`;
+                            exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCommand}"`, (error: any, stdout: string) => {
+                                if (!error && stdout) {
+                                    const files = stdout.trim().split('|');
+                                    if (files.length > 0) {
+                                        sendToClient('fileOpenDialogResult', files);
+                                    }
+                                } else if (error) {
+                                    env.log(`PowerShell File Dialog error: ${error.message}`);
+                                }
+                            });
+                        } else {
+                            // Logic for other platforms (optional)
+                            env.log('File picker only implemented for Windows in this version.');
+                        }
+                    } catch (err: any) {
+                        env.log(`File dialog error: ${err.message || err}`);
                     }
                     break;
             }

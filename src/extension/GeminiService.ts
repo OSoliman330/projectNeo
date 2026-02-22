@@ -382,7 +382,7 @@ export class GeminiService extends EventEmitter {
      * Send a message and stream the response.
      * Handles the full turn loop: send → stream response → execute tools → repeat.
      */
-    async send(prompt: string): Promise<void> {
+    async send(prompt: string, attachments: string[] = []): Promise<void> {
         if (this._processing) {
             this._opts.env.log('Still processing previous message, ignoring.');
             return;
@@ -404,13 +404,48 @@ export class GeminiService extends EventEmitter {
 
         const { GeminiEventType, recordToolCallInteractions, debugLogger, promptIdContext } = this._coreModule;
 
-        this._opts.env.log(`send() called. prompt="${prompt.substring(0, 80)}"`);
+        this._opts.env.log(`send() called. prompt="${prompt.substring(0, 80)}" attachments=${attachments.length}`);
 
         // Telemetry Logging Setup (Safe temp directory)
         const telemetryLog: string[] = [];
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         telemetryLog.push(`# AI Execution Trace: ${timestamp}`);
+        if (attachments.length > 0) {
+            telemetryLog.push(`\n## Attachments\n${attachments.map(a => `- ${a}`).join('\n')}`);
+        }
         telemetryLog.push(`\n## User Prompt\n\`\`\`text\n${prompt}\n\`\`\`\n`);
+
+        // Proactively read attachments to seed context
+        let contextBlock = '';
+        if (attachments.length > 0) {
+            const fs = require('fs');
+            const path = require('path');
+            const workspaceDir = this._opts.env.getWorkspacePath();
+
+            for (const filePath of attachments) {
+                try {
+                    const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(workspaceDir, filePath);
+                    const stats = fs.statSync(absPath);
+                    if (stats.isFile() && stats.size < 100 * 1024) { // 100KB limit for proactive loading
+                        const content = fs.readFileSync(absPath, 'utf8');
+                        const relativePath = path.relative(workspaceDir, absPath);
+                        contextBlock += `\n--- FILE: ${relativePath} ---\n${content}\n--- END FILE ---\n`;
+                        this._opts.env.log(`📎 Proactively loaded attachment: ${relativePath} (${stats.size} bytes)`);
+                    } else if (stats.isDirectory()) {
+                        contextBlock += `\n(Attachment is a directory: ${filePath}. Please explore as needed.)\n`;
+                        this._opts.env.log(`📎 Attachment is a directory, skipping proactive read: ${filePath}`);
+                    } else {
+                        this._opts.env.log(`📎 Attachment skipped (too large or not a file): ${filePath}`);
+                    }
+                } catch (err: any) {
+                    this._opts.env.log(`❌ Could not proactively read attachment ${filePath}: ${err.message}`);
+                }
+            }
+        }
+
+        if (contextBlock) {
+            contextBlock = `The following files have been attached for your context:\n${contextBlock}\n\nPlease use the above information to address the user's request.\n\n`;
+        }
 
         try {
             await promptIdContext.run(promptId, async () => {
@@ -422,7 +457,7 @@ export class GeminiService extends EventEmitter {
                     this._opts.env.log(`Could not get history: ${e}`);
                 }
 
-                let currentParts: any = [{ text: prompt }];
+                let currentParts: any = [{ text: contextBlock + prompt }];
                 let turnCount = 0;
                 let isFirstTurn = true;
 

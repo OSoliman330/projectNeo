@@ -3,11 +3,18 @@ import { vscode } from './vscode-api';
 import './index.css';
 import { Activity, Square, Settings, Database, Code, RefreshCw, Terminal, Layers, FileText, CheckCircle, ShieldCheck, Briefcase, Plus, Trash2, Edit2, Lock, Unlock } from 'lucide-react';
 
+interface PromptItem {
+    label: string;
+    iconName: string;
+    prompt: string;
+    requiresFiles?: boolean;
+}
+
 const DEFAULT_PROMPTS = [
-    { label: "Analyze Codebase", iconName: "Code", prompt: "Analyze the current project structure and summarize the main components and their entry points." },
-    { label: "Check Database", iconName: "Database", prompt: "Review any database or data access patterns in this codebase and suggest optimizations if applicable." },
-    { label: "Find Bugs", iconName: "Activity", prompt: "Review the code for any potential bugs, security issues, or performance bottlenecks." },
-    { label: "Generate Tests", iconName: "RefreshCw", prompt: "Write unit tests for the core utility functions found in the context." },
+    { label: "Analyze Codebase", iconName: "Code", prompt: "Analyze the current project structure and summarize the main components and their entry points.", requiresFiles: false },
+    { label: "Check Database", iconName: "Database", prompt: "Review any database or data access patterns in this codebase and suggest optimizations if applicable.", requiresFiles: false },
+    { label: "Find Bugs", iconName: "Activity", prompt: "Review the code for any potential bugs, security issues, or performance bottlenecks.", requiresFiles: false },
+    { label: "Generate Tests", iconName: "RefreshCw", prompt: "Write unit tests for the core utility functions found in the context.", requiresFiles: false },
 ];
 
 const parseIcon = (name: string, size = 16) => {
@@ -70,17 +77,18 @@ function App() {
     const [showConfig, setShowConfig] = useState(false);
     const [workspacePath, setWorkspacePath] = useState(() => localStorage.getItem('la_workspacePath') || '');
     const [projectName, setProjectName] = useState(() => localStorage.getItem('la_projectName') || 'Genesis');
-    const [prompts, setPrompts] = useState(() => {
+    const [prompts, setPrompts] = useState<PromptItem[]>(() => {
         const saved = localStorage.getItem('la_prompts');
         return saved ? JSON.parse(saved) : DEFAULT_PROMPTS;
     });
 
-    // Workflow Editor State (Passcode Protected)
+    // Workflow Editor State
     const [isEditorUnlocked, setIsEditorUnlocked] = useState(false);
     const [passcode, setPasscode] = useState('');
     const [passcodeError, setPasscodeError] = useState(false);
     const [editingPromptIdx, setEditingPromptIdx] = useState<number | null>(null);
-    const [editPromptTemp, setEditPromptTemp] = useState({ label: '', iconName: 'FileText', prompt: '' });
+    const [editPromptTemp, setEditPromptTemp] = useState<PromptItem | null>(null);
+    const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
 
     useEffect(() => {
         // Broadcast the initial saved config to the server on load
@@ -117,6 +125,13 @@ function App() {
                         setWorkspacePath(message.value);
                     }
                     break;
+                case 'fileOpenDialogResult':
+                    if (message.value && pendingPrompt) {
+                        const attachments = Array.isArray(message.value) ? message.value : [message.value];
+                        executePrompt(pendingPrompt, attachments);
+                        setPendingPrompt(null);
+                    }
+                    break;
             }
         };
 
@@ -124,7 +139,7 @@ function App() {
         window.dispatchEvent(new MessageEvent('message', { data: { type: 'webviewReady' } }));
 
         return () => window.removeEventListener('message', handleMessage);
-    }, []);
+    }, [pendingPrompt]); // Depend on pendingPrompt to ensure handleMessage can access its current value
 
     useEffect(() => {
         logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -134,16 +149,30 @@ function App() {
         setLogs(prev => [...prev, { id: Date.now() + Math.random(), ...log }]);
     };
 
-    const sendPrompt = (prompt: string) => {
-        if (isRunning) return;
+    const executePrompt = (prompt: string, attachments: any[] = []) => {
         setIsRunning(true);
         addLog({ type: 'system', text: `--- Executing: ${prompt} ---` });
+        if (attachments.length > 0) {
+            addLog({ type: 'system', text: `📎 Attachments: ${attachments.join(', ')}` });
+        }
 
         vscode.postMessage({
             type: 'sendMessage',
-            value: { prompt, attachments: [] },
-            attachments: []
+            value: { prompt, attachments },
+            attachments // Also send at top level for compatibility
         });
+    };
+
+    const sendPrompt = (action: PromptItem) => {
+        if (isRunning) return;
+
+        if (action.requiresFiles) {
+            setPendingPrompt(action.prompt);
+            addLog({ type: 'system', text: `📂 Select files/folders for: ${action.label}` });
+            vscode.postMessage({ type: 'showFileOpenDialog' });
+        } else {
+            executePrompt(action.prompt);
+        }
     };
 
     const stopExecution = () => {
@@ -177,7 +206,7 @@ function App() {
     };
 
     const addPrompt = () => {
-        setPrompts([...prompts, { label: "New Task", iconName: "FileText", prompt: "Summarize this file." }]);
+        setPrompts([...prompts, { label: "New Task", iconName: "FileText", prompt: "Summarize this file.", requiresFiles: false }]);
     };
 
     const removePrompt = (idx: number) => {
@@ -190,11 +219,12 @@ function App() {
     };
 
     const saveEditPrompt = () => {
-        if (editingPromptIdx !== null) {
+        if (editingPromptIdx !== null && editPromptTemp) {
             const newPrompts = [...prompts];
-            newPrompts[editingPromptIdx] = editPromptTemp;
+            newPrompts[editingPromptIdx] = editPromptTemp as PromptItem;
             setPrompts(newPrompts);
             setEditingPromptIdx(null);
+            setEditPromptTemp(null);
         }
     };
 
@@ -268,11 +298,11 @@ function App() {
 
                         {/* Compact Wrapping Area for Buttons */}
                         <div className="flex flex-wrap gap-3 pb-2">
-                            {prompts.map((action, i) => (
+                            {prompts.map((action: PromptItem, i: number) => (
                                 <button
                                     key={i}
                                     disabled={!isConnected || isRunning}
-                                    onClick={() => sendPrompt(action.prompt)}
+                                    onClick={() => sendPrompt(action)}
                                     title={action.prompt}
                                     className="group/btn relative flex-1 min-w-[130px] max-w-[200px] flex justify-center items-center gap-2 p-2.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 hover:border-white/20 hover:shadow-[0_4px_15px_rgba(59,130,246,0.15)] transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed overflow-hidden transform hover:-translate-y-0.5"
                                 >
@@ -456,9 +486,9 @@ function App() {
                                 </h3>
 
                                 <div className="space-y-2">
-                                    {prompts.map((p, i) => (
+                                    {prompts.map((p: PromptItem, i: number) => (
                                         <div key={i} className="flex flex-col bg-white/5 border border-white/5 rounded-lg p-3">
-                                            {editingPromptIdx === i ? (
+                                            {editingPromptIdx === i && editPromptTemp ? (
                                                 <div className="space-y-2">
                                                     <div className="flex gap-2">
                                                         <input type="text" value={editPromptTemp.label} onChange={e => setEditPromptTemp({ ...editPromptTemp, label: e.target.value })} className="flex-1 bg-black border border-white/10 rounded px-2 py-1 text-xs text-white" placeholder="Label" />
@@ -471,6 +501,16 @@ function App() {
                                                         </select>
                                                     </div>
                                                     <textarea value={editPromptTemp.prompt} onChange={e => setEditPromptTemp({ ...editPromptTemp, prompt: e.target.value })} className="w-full bg-black border border-white/10 rounded px-2 py-2 text-xs text-white h-16 resize-none mt-1" placeholder="Prompt definition..." />
+                                                    <div className="flex items-center gap-2 mt-1">
+                                                        <input
+                                                            type="checkbox"
+                                                            id={`reqFiles-${i}`}
+                                                            checked={editPromptTemp.requiresFiles || false}
+                                                            onChange={e => setEditPromptTemp({ ...editPromptTemp, requiresFiles: e.target.checked })}
+                                                            className="rounded border-white/10 bg-black"
+                                                        />
+                                                        <label htmlFor={`reqFiles-${i}`} className="text-[10px] text-gray-400 cursor-pointer">Requires file attachments</label>
+                                                    </div>
                                                     <div className="flex justify-end gap-2 mt-1">
                                                         <button onClick={saveEditPrompt} className="text-xs bg-green-500/20 text-green-400 px-3 py-1 rounded">Save</button>
                                                         <button onClick={() => setEditingPromptIdx(null)} className="text-xs bg-white/10 text-white px-3 py-1 rounded">Cancel</button>
@@ -482,7 +522,10 @@ function App() {
                                                         {parseIcon(p.iconName, 14)}
                                                     </div>
                                                     <div className="flex-1">
-                                                        <div className="text-sm font-bold text-gray-200">{p.label}</div>
+                                                        <div className="flex items-center gap-2">
+                                                            <div className="text-sm font-bold text-gray-200">{p.label}</div>
+                                                            {p.requiresFiles && <span className="px-1.5 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[9px] font-bold">FILES</span>}
+                                                        </div>
                                                         <div className="text-[11px] text-gray-500 line-clamp-2 mt-0.5">{p.prompt}</div>
                                                     </div>
                                                     {isEditorUnlocked && (
