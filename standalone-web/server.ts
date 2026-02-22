@@ -34,7 +34,15 @@ const env = {
 wss.on('connection', (ws: WebSocket) => {
     env.log('Client connected to WebSocket');
 
-    const geminiService = new GeminiService({ cliPath: '', env });
+    // Default to the parent folder of standalone-web (the extension root)
+    let currentWorkspacePath = path.resolve(process.cwd(), '..');
+
+    const dynamicEnv = {
+        ...env,
+        getWorkspacePath: () => currentWorkspacePath
+    };
+
+    const geminiService = new GeminiService({ cliPath: '', env: dynamicEnv });
 
     const sendToClient = (type: string, value?: any) => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -99,6 +107,46 @@ wss.on('connection', (ws: WebSocket) => {
                 case 'restart':
                     geminiService.restart();
                     sendToClient('systemMessage', '🔄 Context cleared / process restarted.');
+                    break;
+                case 'setConfig':
+                    if (data.value && data.value.workspace) {
+                        currentWorkspacePath = data.value.workspace;
+                        env.log(`Workspace path updated to: ${currentWorkspacePath}`);
+                        geminiService.restart();
+                        sendToClient('systemMessage', `⚙️ Workspace context updated to: ${currentWorkspacePath}. Process restarted.`);
+                    }
+                    break;
+                case 'showOpenDialog':
+                    try {
+                        const { exec } = require('child_process');
+                        if (process.platform === 'win32') {
+                            // Fast PowerShell-based folder picker for Windows
+                            const psCommand = `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Workspace Folder'; $f.ShowNewFolderButton = $true; if($f.ShowDialog() -eq 'OK'){$f.SelectedPath}`;
+                            exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCommand}"`, (error: any, stdout: string) => {
+                                if (!error && stdout) {
+                                    const selectedPath = stdout.trim();
+                                    if (selectedPath) {
+                                        sendToClient('openDialogResult', selectedPath);
+                                    }
+                                } else if (error) {
+                                    env.log(`PowerShell Dialog error: ${error.message}`);
+                                }
+                            });
+                        } else {
+                            // Fallback to Python for macOS/Linux if needed
+                            const pythonScript = `import tkinter as tk; from tkinter import filedialog; root = tk.Tk(); root.withdraw(); path = filedialog.askdirectory(); print(path)`;
+                            exec(`python -c "${pythonScript}"`, (error: any, stdout: string) => {
+                                if (!error && stdout) {
+                                    const selectedPath = stdout.trim();
+                                    if (selectedPath) {
+                                        sendToClient('openDialogResult', selectedPath);
+                                    }
+                                }
+                            });
+                        }
+                    } catch (err: any) {
+                        env.log(`Dialog initialization error: ${err.message || err}`);
+                    }
                     break;
             }
         } catch (e) {

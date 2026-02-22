@@ -1,14 +1,24 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { vscode } from './vscode-api';
 import './index.css';
-import { Activity, Square, Settings, Database, Code, RefreshCw, Terminal, Layers, FileText, CheckCircle, ShieldCheck, Briefcase } from 'lucide-react';
+import { Activity, Square, Settings, Database, Code, RefreshCw, Terminal, Layers, FileText, CheckCircle, ShieldCheck, Briefcase, Plus, Trash2, Edit2, Lock, Unlock } from 'lucide-react';
 
-const PREDEFINED_PROMPTS = [
-    { label: "Analyze Codebase", icon: <Code size={16} />, prompt: "Analyze the current project structure and summarize the main components and their entry points." },
-    { label: "Check Database", icon: <Database size={16} />, prompt: "Review any database or data access patterns in this codebase and suggest optimizations if applicable." },
-    { label: "Find Bugs", icon: <Activity size={16} />, prompt: "Review the code for any potential bugs, security issues, or performance bottlenecks." },
-    { label: "Generate Tests", icon: <RefreshCw size={16} />, prompt: "Write unit tests for the core utility functions found in the context." },
+const DEFAULT_PROMPTS = [
+    { label: "Analyze Codebase", iconName: "Code", prompt: "Analyze the current project structure and summarize the main components and their entry points." },
+    { label: "Check Database", iconName: "Database", prompt: "Review any database or data access patterns in this codebase and suggest optimizations if applicable." },
+    { label: "Find Bugs", iconName: "Activity", prompt: "Review the code for any potential bugs, security issues, or performance bottlenecks." },
+    { label: "Generate Tests", iconName: "RefreshCw", prompt: "Write unit tests for the core utility functions found in the context." },
 ];
+
+const parseIcon = (name: string, size = 16) => {
+    switch (name) {
+        case 'Code': return <Code size={size} />;
+        case 'Database': return <Database size={size} />;
+        case 'Activity': return <Activity size={size} />;
+        case 'RefreshCw': return <RefreshCw size={size} />;
+        default: return <FileText size={size} />;
+    }
+};
 
 const AGENTS = [
     { name: "Architecture", icon: <Layers size={24} />, desc: "Develops software architectural design (SWE.2), allocating requirements to components for safety-critical systems." },
@@ -56,6 +66,28 @@ function App() {
     const [isRunning, setIsRunning] = useState(false);
     const logEndRef = useRef<HTMLDivElement>(null);
 
+    // Configuration State
+    const [showConfig, setShowConfig] = useState(false);
+    const [workspacePath, setWorkspacePath] = useState(() => localStorage.getItem('la_workspacePath') || '');
+    const [projectName, setProjectName] = useState(() => localStorage.getItem('la_projectName') || 'Genesis');
+    const [prompts, setPrompts] = useState(() => {
+        const saved = localStorage.getItem('la_prompts');
+        return saved ? JSON.parse(saved) : DEFAULT_PROMPTS;
+    });
+
+    // Workflow Editor State (Passcode Protected)
+    const [isEditorUnlocked, setIsEditorUnlocked] = useState(false);
+    const [passcode, setPasscode] = useState('');
+    const [passcodeError, setPasscodeError] = useState(false);
+    const [editingPromptIdx, setEditingPromptIdx] = useState<number | null>(null);
+    const [editPromptTemp, setEditPromptTemp] = useState({ label: '', iconName: 'FileText', prompt: '' });
+
+    useEffect(() => {
+        // Broadcast the initial saved config to the server on load
+        if (workspacePath) {
+            vscode.postMessage({ type: 'setConfig', value: { workspace: workspacePath, project: projectName } });
+        }
+    }, []);
     useEffect(() => {
         const handleMessage = (event: MessageEvent) => {
             const message = event.data;
@@ -79,6 +111,11 @@ function App() {
                 case 'responseComplete':
                     setIsRunning(false);
                     addLog({ type: 'system', text: '--- Execution Complete ---' });
+                    break;
+                case 'openDialogResult':
+                    if (message.value) {
+                        setWorkspacePath(message.value);
+                    }
                     break;
             }
         };
@@ -120,6 +157,47 @@ function App() {
         setLogs([]);
     };
 
+    const saveConfig = () => {
+        localStorage.setItem('la_workspacePath', workspacePath);
+        localStorage.setItem('la_projectName', projectName);
+        localStorage.setItem('la_prompts', JSON.stringify(prompts));
+        vscode.postMessage({ type: 'setConfig', value: { workspace: workspacePath, project: projectName } });
+        setShowConfig(false);
+        setIsEditorUnlocked(false);
+        setPasscode('');
+    };
+
+    const unlockEditor = () => {
+        if (passcode === '1234') {
+            setIsEditorUnlocked(true);
+            setPasscodeError(false);
+        } else {
+            setPasscodeError(true);
+        }
+    };
+
+    const addPrompt = () => {
+        setPrompts([...prompts, { label: "New Task", iconName: "FileText", prompt: "Summarize this file." }]);
+    };
+
+    const removePrompt = (idx: number) => {
+        setPrompts(prompts.filter((_, i) => i !== idx));
+    };
+
+    const startEditing = (idx: number) => {
+        setEditingPromptIdx(idx);
+        setEditPromptTemp(prompts[idx]);
+    };
+
+    const saveEditPrompt = () => {
+        if (editingPromptIdx !== null) {
+            const newPrompts = [...prompts];
+            newPrompts[editingPromptIdx] = editPromptTemp;
+            setPrompts(newPrompts);
+            setEditingPromptIdx(null);
+        }
+    };
+
     return (
         <div className="flex w-screen h-screen bg-[#0a0a0a] text-gray-200 font-sans selection:bg-blue-500/30 overflow-hidden relative">
 
@@ -136,17 +214,33 @@ function App() {
 
                     {/* Header */}
                     <div className="flex px-10 justify-between items-center mb-6 shrink-0">
-                        <h1 className="text-3xl font-bold tracking-tight text-white flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg shadow-purple-500/30 flex items-center justify-center">
-                                <Terminal size={18} className="text-white" />
+                        <div className="flex items-center gap-4">
+                            <h1 className="text-3xl font-bold tracking-tight text-white flex items-center gap-3">
+                                <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg shadow-purple-500/30 flex items-center justify-center">
+                                    <Terminal size={18} className="text-white" />
+                                </div>
+                                Lite Agent
+                            </h1>
+                            {projectName && (
+                                <span className="px-2.5 py-1 rounded-md bg-blue-500/10 border border-blue-500/20 text-blue-300 text-xs font-semibold tracking-wide">
+                                    {projectName}
+                                </span>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 backdrop-blur-md">
+                                <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-400 shadow-[0_0_8px_rgba(74,222,128,0.8)]' : 'bg-red-500 animate-pulse'}`} />
+                                <span className="text-xs uppercase tracking-wider font-semibold text-gray-300">
+                                    {isConnected ? 'System Ready' : 'Connecting...'}
+                                </span>
                             </div>
-                            Lite Agent
-                        </h1>
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 backdrop-blur-md">
-                            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-400 shadow-[0_0_8px_rgba(74,222,128,0.8)]' : 'bg-red-500 animate-pulse'}`} />
-                            <span className="text-xs uppercase tracking-wider font-semibold text-gray-300">
-                                {isConnected ? 'System Ready' : 'Connecting...'}
-                            </span>
+                            <button
+                                onClick={() => setShowConfig(true)}
+                                className="p-2 rounded-full bg-white/5 border border-white/10 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                                title="Workspace Configuration"
+                            >
+                                <Settings size={16} />
+                            </button>
                         </div>
                     </div>
 
@@ -174,7 +268,7 @@ function App() {
 
                         {/* Compact Wrapping Area for Buttons */}
                         <div className="flex flex-wrap gap-3 pb-2">
-                            {PREDEFINED_PROMPTS.map((action, i) => (
+                            {prompts.map((action, i) => (
                                 <button
                                     key={i}
                                     disabled={!isConnected || isRunning}
@@ -185,7 +279,7 @@ function App() {
                                     <div className="absolute inset-0 bg-gradient-to-br from-blue-500/0 via-white/5 to-purple-500/0 opacity-0 group-hover/btn:opacity-100 transition-opacity duration-500" />
 
                                     <div className="text-blue-400 group-hover/btn:text-blue-300 transition-colors drop-shadow-[0_0_8px_rgba(59,130,246,0.3)] shrink-0">
-                                        {action.icon}
+                                        {parseIcon(action.iconName)}
                                     </div>
                                     <div className="font-semibold text-gray-200 group-hover/btn:text-white transition-colors text-xs whitespace-nowrap overflow-hidden text-ellipsis">
                                         {action.label}
@@ -284,6 +378,152 @@ function App() {
                     </div>
                 </div>
             </div>
+
+            {/* Configuration Modal */}
+            {showConfig && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm px-4">
+                    <div className="w-full max-w-2xl bg-[#111] border border-white/10 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+                        <div className="px-6 py-4 border-b border-white/10 bg-white/5 flex justify-between items-center shrink-0">
+                            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                                <Settings size={20} className="text-blue-400" />
+                                Dashboard Settings
+                            </h2>
+                            <button onClick={() => setShowConfig(false)} className="text-gray-400 hover:text-white">
+                                <Square size={16} />
+                            </button>
+                        </div>
+
+                        <div className="p-6 overflow-y-auto custom-scrollbar flex-1">
+                            {/* General Context Settings */}
+                            <div className="mb-8">
+                                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4 border-b border-white/5 pb-2">Environment Context</h3>
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-300 mb-1">Absolute Workspace Path</label>
+                                        <div className="flex gap-2">
+                                            <input
+                                                type="text"
+                                                value={workspacePath}
+                                                onChange={e => setWorkspacePath(e.target.value)}
+                                                placeholder="e.g. C:\workspace\projectNeo"
+                                                className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500/50"
+                                            />
+                                            <button
+                                                onClick={() => vscode.postMessage({ type: 'showOpenDialog' })}
+                                                className="px-3 py-2 bg-white/10 hover:bg-white/20 border border-white/10 text-white rounded-lg text-xs transition-colors whitespace-nowrap"
+                                            >
+                                                Browse...
+                                            </button>
+                                        </div>
+                                        <p className="text-[10px] text-gray-500 mt-1">Tools and AI actions will operate relative to this directory.</p>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-300 mb-1">Active Project Name</label>
+                                        <select
+                                            value={projectName}
+                                            onChange={e => setProjectName(e.target.value)}
+                                            className="w-full bg-black/50 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500/50"
+                                        >
+                                            <option value="Genesis">Genesis</option>
+                                            <option value="ProjectNeo">ProjectNeo</option>
+                                            <option value="RAG_System">RAG System</option>
+                                            <option value="System">System</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Quick Workflows Editor Sandbox */}
+                            <div>
+                                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4 border-b border-white/5 pb-2 flex justify-between items-center">
+                                    Quick Workflows (Prompts)
+                                    {!isEditorUnlocked ? (
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                type="password"
+                                                placeholder="Passcode"
+                                                value={passcode}
+                                                onChange={e => setPasscode(e.target.value)}
+                                                className={`w-24 bg-black/50 border ${passcodeError ? 'border-red-500' : 'border-white/10'} rounded text-xs px-2 py-1 text-center`}
+                                            />
+                                            <button onClick={unlockEditor} className="text-xs bg-blue-500/20 text-blue-400 px-2 py-1 rounded hover:bg-blue-500/30 flex items-center gap-1">
+                                                <Lock size={10} /> Unlock
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <span className="text-green-400 text-xs flex items-center gap-1"><Unlock size={12} /> Editable</span>
+                                    )}
+                                </h3>
+
+                                <div className="space-y-2">
+                                    {prompts.map((p, i) => (
+                                        <div key={i} className="flex flex-col bg-white/5 border border-white/5 rounded-lg p-3">
+                                            {editingPromptIdx === i ? (
+                                                <div className="space-y-2">
+                                                    <div className="flex gap-2">
+                                                        <input type="text" value={editPromptTemp.label} onChange={e => setEditPromptTemp({ ...editPromptTemp, label: e.target.value })} className="flex-1 bg-black border border-white/10 rounded px-2 py-1 text-xs text-white" placeholder="Label" />
+                                                        <select value={editPromptTemp.iconName} onChange={e => setEditPromptTemp({ ...editPromptTemp, iconName: e.target.value })} className="w-24 bg-black border border-white/10 rounded px-1 py-1 text-xs text-white">
+                                                            <option value="Code">Code</option>
+                                                            <option value="Database">Database</option>
+                                                            <option value="Activity">Activity</option>
+                                                            <option value="FileText">Document</option>
+                                                            <option value="RefreshCw">Refresh</option>
+                                                        </select>
+                                                    </div>
+                                                    <textarea value={editPromptTemp.prompt} onChange={e => setEditPromptTemp({ ...editPromptTemp, prompt: e.target.value })} className="w-full bg-black border border-white/10 rounded px-2 py-2 text-xs text-white h-16 resize-none mt-1" placeholder="Prompt definition..." />
+                                                    <div className="flex justify-end gap-2 mt-1">
+                                                        <button onClick={saveEditPrompt} className="text-xs bg-green-500/20 text-green-400 px-3 py-1 rounded">Save</button>
+                                                        <button onClick={() => setEditingPromptIdx(null)} className="text-xs bg-white/10 text-white px-3 py-1 rounded">Cancel</button>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="flex justify-between items-start gap-3">
+                                                    <div className="flex items-center gap-2 mt-0.5 opacity-60">
+                                                        {parseIcon(p.iconName, 14)}
+                                                    </div>
+                                                    <div className="flex-1">
+                                                        <div className="text-sm font-bold text-gray-200">{p.label}</div>
+                                                        <div className="text-[11px] text-gray-500 line-clamp-2 mt-0.5">{p.prompt}</div>
+                                                    </div>
+                                                    {isEditorUnlocked && (
+                                                        <div className="flex flex-col gap-1 items-end shrink-0">
+                                                            <button onClick={() => startEditing(i)} className="text-[10px] text-blue-400 hover:underline flex items-center gap-1"><Edit2 size={10} /> Edit</button>
+                                                            <button onClick={() => removePrompt(i)} className="text-[10px] text-red-400 hover:underline flex items-center gap-1"><Trash2 size={10} /> Remove</button>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    ))}
+
+                                    {isEditorUnlocked && (
+                                        <button onClick={addPrompt} className="w-full mt-2 py-2 border border-dashed border-white/20 rounded-lg text-xs text-gray-400 hover:bg-white/5 hover:text-white flex items-center justify-center gap-2 transition-colors">
+                                            <Plus size={14} /> Add Workflow
+                                        </button>
+                                    )}
+                                </div>
+
+                            </div>
+                        </div>
+
+                        {/* Modal Footer */}
+                        <div className="px-6 py-4 border-t border-white/10 bg-white/5 flex flex-row-reverse gap-3 shrink-0">
+                            <button
+                                onClick={saveConfig}
+                                className="px-5 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg text-sm shadow-[0_0_15px_rgba(37,99,235,0.3)] transition-all"
+                            >
+                                Save & Restart
+                            </button>
+                            <button
+                                onClick={() => { setShowConfig(false); setIsEditorUnlocked(false); }}
+                                className="px-5 py-2 bg-transparent hover:bg-white/5 border border-white/10 text-gray-300 font-medium rounded-lg text-sm transition-all"
+                            >
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
