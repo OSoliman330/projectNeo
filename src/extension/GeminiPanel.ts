@@ -47,6 +47,10 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                     if (this._geminiService?.isReady) {
                         this._view?.webview.postMessage({ type: 'statusUpdate', value: 'connected' });
                     }
+                    this._sendWorkflows();
+                    break;
+                case 'getWorkflows':
+                    this._sendWorkflows();
                     break;
                 case 'stop':
                     this._geminiService?.stop();
@@ -134,8 +138,27 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
             this._view?.webview.postMessage({ type: 'requestAuthorization', value: data });
         });
 
+        // Handle workflow that requires files
+        this._geminiService.on('requestWorkflowFiles', (workflow: any) => {
+            this._handleWorkflowFiles(workflow);
+        });
+
         // Start SDK (async, fires 'status' and 'activity' events)
         void this._geminiService.start();
+    }
+
+    private async _handleWorkflowFiles(workflow: any) {
+        const uris = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: true,
+            canSelectMany: true,
+            title: `Select files for workflow: ${workflow.label}`,
+        });
+
+        if (uris) {
+            const attachmentPaths = uris.map(u => u.fsPath);
+            await this._geminiService?.send(workflow.prompt, attachmentPaths);
+        }
     }
 
     /*─────────────────────────────────────────────────
@@ -147,14 +170,8 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
             this._initGeminiService();
         }
 
-        // Build full prompt with attachment context
-        let fullPrompt = prompt;
-        if (attachments.length > 0) {
-            const attachmentList = attachments.map(a => a.path).join(', ');
-            fullPrompt = `[Attached: ${attachmentList}] ${prompt}`;
-        }
-
-        await this._geminiService!.send(fullPrompt);
+        const attachmentPaths = attachments.map(a => a.path);
+        await this._geminiService!.send(prompt, attachmentPaths);
     }
 
     /*─────────────────────────────────────────────────
@@ -199,6 +216,7 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
                         '`/status` — Show connection status',
                         '`/mcp` — List connected MCP servers and their tools',
                         '`/tools` — List all available tools',
+                        '`/workflows` — List or execute custom workflows',
                         '`/log` — Open debug log output',
                         '`/help` — Show this help message',
                     ].join('\n'),
@@ -273,6 +291,11 @@ export class GeminiPanel implements vscode.WebviewViewProvider {
     /*─────────────────────────────────────────────────
      * Webview HTML
      *────────────────────────────────────────────────*/
+
+    private _sendWorkflows() {
+        const workflows = this._geminiService?.predefinedWorkflows || [];
+        this._view?.webview.postMessage({ type: 'workflowsLoaded', value: workflows });
+    }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
         const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'dist', 'webview.js'));

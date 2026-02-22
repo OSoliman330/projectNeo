@@ -152,6 +152,7 @@ export class GeminiService extends EventEmitter {
             this.emit('activity', 'Initializing tools and MCP...');
             const startTime = Date.now();
             await this._config.initialize();
+
             const initDuration = Date.now() - startTime;
             this._opts.env.log(`Config/MCP initialization took ${initDuration}ms`);
 
@@ -227,6 +228,10 @@ export class GeminiService extends EventEmitter {
                 this._listSkills();
                 return true;
             }
+            case 'workflows': {
+                this._handleWorkflowsCommand(subCommand);
+                return true;
+            }
             case 'clear':
             case 'restart':
             case 'status':
@@ -246,6 +251,41 @@ export class GeminiService extends EventEmitter {
             default:
                 return false; // Unknown: forward to model
         }
+    }
+
+    private _handleWorkflowsCommand(args?: string): void {
+        const workflows = GeminiService.PREDEFINED_WORKFLOWS;
+
+        if (!args || args.trim() === '') {
+            const list = workflows.map(w => `- \`/workflows ${w.label}\`: ${w.prompt.substring(0, 50)}...${w.requiresFiles ? ' 📎' : ''}`).join('\n');
+            this.emit('data', `\n\n📂 **Predefined Workflows**:\n${list}\n\nType \`/workflows <name>\` to run one.`);
+            this.emit('responseComplete');
+        } else {
+            const name = args.trim();
+            const workflow = workflows.find(w => w.label.toLowerCase() === name.toLowerCase());
+            if (workflow) {
+                if (workflow.requiresFiles) {
+                    this.emit('requestWorkflowFiles', workflow);
+                } else {
+                    void this.send(workflow.prompt);
+                }
+            } else {
+                this.emit('data', `\n\n⚠️ Workflow **"${name}"** not found.`);
+                this.emit('responseComplete');
+            }
+        }
+    }
+
+    public static readonly PREDEFINED_WORKFLOWS = [
+        { label: "Analyze Codebase", prompt: "Perform a deep-dive analysis of the codebase structure, entry points, and primary data flows.", requiresFiles: false },
+        { label: "Find Bugs", prompt: "Scan the current files for potential deadlocks, race conditions, or logic errors. Focus on robustness.", requiresFiles: false },
+        { label: "Generate Tests", prompt: "Write comprehensive unit tests for the core logic in this file, ensuring high edge-case coverage.", requiresFiles: true },
+        { label: "Explain Logic", prompt: "Walk me through the logic of this component in plain English, highlighting any architectural patterns used.", requiresFiles: false },
+        { label: "Summarize Changes", prompt: "Summarize the key functional changes between the current state and the base implementation.", requiresFiles: true },
+    ];
+
+    public get predefinedWorkflows() {
+        return GeminiService.PREDEFINED_WORKFLOWS;
     }
 
     private async _debugHistory() {

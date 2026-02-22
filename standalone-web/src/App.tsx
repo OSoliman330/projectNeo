@@ -77,10 +77,7 @@ function App() {
     const [showConfig, setShowConfig] = useState(false);
     const [workspacePath, setWorkspacePath] = useState(() => localStorage.getItem('la_workspacePath') || '');
     const [projectName, setProjectName] = useState(() => localStorage.getItem('la_projectName') || 'Genesis');
-    const [prompts, setPrompts] = useState<PromptItem[]>(() => {
-        const saved = localStorage.getItem('la_prompts');
-        return saved ? JSON.parse(saved) : DEFAULT_PROMPTS;
-    });
+    const [prompts, setPrompts] = useState<PromptItem[]>(DEFAULT_PROMPTS);
 
     // Workflow Editor State
     const [isEditorUnlocked, setIsEditorUnlocked] = useState(false);
@@ -123,6 +120,7 @@ function App() {
                 case 'openDialogResult':
                     if (message.value) {
                         setWorkspacePath(message.value);
+                        localStorage.setItem('la_workspacePath', message.value);
                     }
                     break;
                 case 'fileOpenDialogResult':
@@ -227,6 +225,11 @@ function App() {
             setEditPromptTemp(null);
         }
     };
+
+    // Keep prompts synced with localStorage
+    useEffect(() => {
+        localStorage.setItem('la_prompts', JSON.stringify(prompts));
+    }, [prompts]);
 
     return (
         <div className="flex w-screen h-screen bg-[#0a0a0a] text-gray-200 font-sans selection:bg-blue-500/30 overflow-hidden relative">

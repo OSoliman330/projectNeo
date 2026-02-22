@@ -5,7 +5,11 @@ export function activate(context: vscode.ExtensionContext) {
     const provider = new GeminiPanel(context.extensionUri);
 
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(GeminiPanel.viewType, provider)
+        vscode.window.registerWebviewViewProvider(GeminiPanel.viewType, provider, {
+            webviewOptions: {
+                retainContextWhenHidden: true
+            }
+        })
     );
 
     context.subscriptions.push(

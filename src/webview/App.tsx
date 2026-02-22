@@ -33,6 +33,7 @@ const COMMANDS = [
     { name: '/debug', description: 'Debug chat history', icon: Zap },
     { name: '/agents', description: 'List available agents', icon: Bot },
     { name: '/skills', description: 'List available skills', icon: FileText },
+    { name: '/workflows', description: 'List predefined workflows', icon: Zap },
 ];
 
 const App: React.FC = () => {
@@ -46,8 +47,9 @@ const App: React.FC = () => {
     const [authRequest, setAuthRequest] = useState<AuthorizationRequest | null>(null);
 
     // Slash command menu state
+    const [workflows, setWorkflows] = useState<any[]>([]);
     const [showCommandMenu, setShowCommandMenu] = useState(false);
-    const [filteredCommands, setFilteredCommands] = useState(COMMANDS);
+    const [filteredCommands, setFilteredCommands] = useState<any[]>([]);
     const [selectedIndex, setSelectedIndex] = useState(0);
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -97,6 +99,10 @@ const App: React.FC = () => {
                     setConnectionStatus(message.value);
                     break;
 
+                case 'workflowsLoaded':
+                    setWorkflows(message.value || []);
+                    break;
+
                 case 'activityStep':
                     setActivitySteps(prev => [...prev, { type: 'activity', value: message.value }]);
                     break;
@@ -139,16 +145,38 @@ const App: React.FC = () => {
     useEffect(() => {
         if (input.startsWith('/')) {
             const searchTerm = input.toLowerCase();
-            const filtered = COMMANDS.filter(cmd =>
-                cmd.name.toLowerCase().startsWith(searchTerm)
-            );
-            setFilteredCommands(filtered);
-            setSelectedIndex(0);
-            setShowCommandMenu(filtered.length > 0);
+
+            if (searchTerm === '/workflows' || searchTerm.startsWith('/workflows ')) {
+                // Workflow sub-menu (nested)
+                // Filter workflows based on what follows "/workflows "
+                const subSearch = searchTerm.startsWith('/workflows ')
+                    ? searchTerm.slice('/workflows '.length).trim()
+                    : '';
+
+                const filtered = workflows
+                    .filter(w => w.label.toLowerCase().includes(subSearch))
+                    .map(w => ({
+                        name: `/workflows ${w.label}`,
+                        description: `Run: ${w.label}`,
+                        icon: Zap
+                    }));
+
+                setFilteredCommands(filtered);
+                setSelectedIndex(0);
+                setShowCommandMenu(filtered.length > 0);
+            } else {
+                // Main root menu
+                const filtered = COMMANDS.filter(cmd =>
+                    cmd.name.toLowerCase().startsWith(searchTerm)
+                );
+                setFilteredCommands(filtered);
+                setSelectedIndex(0);
+                setShowCommandMenu(filtered.length > 0);
+            }
         } else {
             setShowCommandMenu(false);
         }
-    }, [input]);
+    }, [input, workflows]);
 
     // Scroll selected command into view when selection changes
     useEffect(() => {
@@ -373,14 +401,6 @@ const App: React.FC = () => {
                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             <span>Thinking...</span>
                         </div>
-                        {/* Stop Button (only when loading) */}
-                        <button
-                            onClick={handleStop}
-                            className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-500/20 text-red-500 transition-colors"
-                            title="Stop Execution"
-                        >
-                            <Octagon size={14} fill="currentColor" className="opacity-80" />
-                        </button>
                     </div>
                 )}
 
@@ -568,12 +588,13 @@ const App: React.FC = () => {
                                 </button>
                             </div>
                             <button
-                                onClick={handleSend}
-                                disabled={(!input.trim() && attachments.length === 0) || isLoading}
-                                className="p-1.5 rounded disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                                style={{ backgroundColor: 'var(--vscode-button-background)', color: 'var(--vscode-button-foreground)' }}
+                                onClick={isLoading ? handleStop : handleSend}
+                                disabled={!isLoading && !input.trim() && attachments.length === 0}
+                                className={`p-1.5 rounded transition-all ${isLoading ? 'hover:bg-red-500/20 text-red-500' : 'disabled:opacity-30 disabled:cursor-not-allowed'}`}
+                                style={!isLoading ? { backgroundColor: 'var(--vscode-button-background)', color: 'var(--vscode-button-foreground)' } : {}}
+                                title={isLoading ? "Stop Execution" : "Send Prompt"}
                             >
-                                <Send size={14} />
+                                {isLoading ? <StopCircle size={14} fill="currentColor" className="opacity-80" /> : <Send size={14} />}
                             </button>
                         </div>
                     </div>
